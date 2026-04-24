@@ -456,8 +456,12 @@ fn jumpUnreviewed(snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *S
 }
 
 fn fileTreeStart(snapshot: diff.DiffSnapshot, state: *const State, height: usize) usize {
-    if (height <= 2 or state.active_file < height - 1) return 0;
-    return @min(state.active_file - height + 2, snapshot.files.len);
+    return fileTreeStartIndex(snapshot.files.len, state.active_file, height);
+}
+
+fn fileTreeStartIndex(file_count: usize, active_file: usize, height: usize) usize {
+    if (height <= 2 or active_file < height - 1) return 0;
+    return @min(active_file - (height - 2), file_count);
 }
 
 fn addCommentAtCursor(
@@ -637,4 +641,10 @@ test "parse sgr mouse wheel" {
 test "display width handles cjk" {
     try std.testing.expectEqual(@as(usize, 1), displayWidth("a"));
     try std.testing.expectEqual(@as(usize, 2), displayWidth("架"));
+}
+
+test "file tree start avoids unsigned underflow at first scroll row" {
+    try std.testing.expectEqual(@as(usize, 0), fileTreeStartIndex(20, 0, 5));
+    try std.testing.expectEqual(@as(usize, 0), fileTreeStartIndex(20, 3, 5));
+    try std.testing.expectEqual(@as(usize, 1), fileTreeStartIndex(20, 4, 5));
 }
