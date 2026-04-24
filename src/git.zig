@@ -2,6 +2,8 @@ const std = @import("std");
 const diff = @import("diff.zig");
 const util = @import("util.zig");
 
+const full_context_arg = "--unified=1000000";
+
 pub const GitError = error{
     NotGitRepository,
     GitCommandFailed,
@@ -125,13 +127,13 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, io: std.Io, repo: diff.Reposit
 
     const runner = GitRunner{ .allocator = allocator, .io = io, .repo_root = repo.root_path, .debug = debug };
     if (target.kind == .working_tree) {
-        try appendPatch(allocator, &files, runner, &.{ "diff", "--patch", "--find-renames", "--no-ext-diff" }, .unstaged);
-        try appendPatch(allocator, &files, runner, &.{ "diff", "--cached", "--patch", "--find-renames", "--no-ext-diff" }, .staged);
+        try appendPatch(allocator, &files, runner, &.{ "diff", "--patch", "--find-renames", "--no-ext-diff", full_context_arg }, .unstaged);
+        try appendPatch(allocator, &files, runner, &.{ "diff", "--cached", "--patch", "--find-renames", "--no-ext-diff", full_context_arg }, .staged);
         try appendUntrackedFiles(allocator, io, &files, runner);
     } else {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(allocator);
-        try args.appendSlice(allocator, &.{ "diff", "--patch", "--find-renames", "--no-ext-diff" });
+        try args.appendSlice(allocator, &.{ "diff", "--patch", "--find-renames", "--no-ext-diff", full_context_arg });
         for (target.raw_args) |arg| try args.append(allocator, arg);
         try appendPatch(allocator, &files, runner, args.items, .explicit);
     }

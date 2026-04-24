@@ -5,6 +5,8 @@ pub const store = @import("store.zig");
 pub const syntax = @import("syntax.zig");
 pub const theme = @import("theme.zig");
 pub const tui = @import("tui.zig");
+pub const tui_text = @import("tui_text.zig");
+pub const tui_view = @import("tui_view.zig");
 pub const util = @import("util.zig");
 
 test {
@@ -15,5 +17,7 @@ test {
     _ = syntax;
     _ = theme;
     _ = tui;
+    _ = tui_text;
+    _ = tui_view;
     _ = util;
 }
