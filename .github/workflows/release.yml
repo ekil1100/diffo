@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Test
+        run: zig build test
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-linux-gnu
+            binary: diffo
+            archive: diffo-linux-x86_64.tar.gz
+          - name: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-gnu
+            binary: diffo
+            archive: diffo-linux-aarch64.tar.gz
+          - name: macos-x86_64
+            runner: macos-13
+            target: x86_64-macos
+            binary: diffo
+            archive: diffo-macos-x86_64.tar.gz
+          - name: macos-aarch64
+            runner: macos-14
+            target: aarch64-macos
+            binary: diffo
+            archive: diffo-macos-aarch64.tar.gz
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-windows-gnu
+            binary: diffo.exe
+            archive: diffo-windows-x86_64.zip
+          - name: windows-aarch64
+            runner: windows-latest
+            target: aarch64-windows-gnu
+            binary: diffo.exe
+            archive: diffo-windows-aarch64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build release binary
+        shell: bash
+        run: zig build --release=fast -Dtarget="${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp "zig-out/bin/${{ matrix.binary }}" "package/${{ matrix.binary }}"
+          cp README.md package/README.md
+
+          if [[ "${{ matrix.archive }}" == *.zip ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path package/* -DestinationPath '${{ matrix.archive }}'"
+          else
+            tar -czf "${{ matrix.archive }}" -C package .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

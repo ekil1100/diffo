@@ -101,6 +101,13 @@ pub fn run(
 
     var state = State{};
     defer state.deinit(allocator);
+    if (builtin.os.tag == .windows) {
+        const screen = try render(allocator, snapshot.*, store.*, state, false);
+        defer allocator.free(screen);
+        try writeAll(io, screen);
+        return;
+    }
+
     const is_tty = (std.Io.File.stdout().isTty(io) catch false) and (std.Io.File.stdin().isTty(io) catch false);
     if (!is_tty) {
         const screen = try render(allocator, snapshot.*, store.*, state, false);
