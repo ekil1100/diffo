@@ -54,7 +54,7 @@ const Layout = struct {
             .width = width,
             .height = height,
             .body_y = 2,
-            .body_height = height - 3,
+            .body_height = height - 2,
             .main_width = main_width,
             .sidebar_x = main_width + separator_width + 1,
             .sidebar_width = sidebar_width,
@@ -266,7 +266,7 @@ fn render(
     try out.appendSlice(allocator, clear_eol);
     try out.append(allocator, '\n');
 
-    const diff_lines = try renderDiffLines(allocator, snapshot.files[state.active_file], view, state, layout.main_width, layout.body_height, ansi, palette);
+    const diff_lines = try renderDiffLines(allocator, snapshot.files[state.active_file], store, view, state, layout.main_width, layout.body_height, ansi, palette);
     defer {
         for (diff_lines) |line| allocator.free(line);
         allocator.free(diff_lines);
@@ -323,6 +323,7 @@ fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tex
 fn renderDiffLines(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
+    store: store_mod.Store,
     view: tui_view.FileView,
     state: State,
     width: usize,
@@ -340,7 +341,7 @@ fn renderDiffLines(
     const end = @min(total, start + height);
     const line_width = lineNumberWidth(file);
     for (start..end) |row_index| {
-        const rendered = try renderVisualRow(allocator, file, view, view.rows[row_index], row_index, state, width, line_width, ansi, palette);
+        const rendered = try renderVisualRow(allocator, file, store, view, view.rows[row_index], row_index, state, width, line_width, ansi, palette);
         try lines.append(allocator, rendered);
     }
     return lines.toOwnedSlice(allocator);
@@ -349,6 +350,7 @@ fn renderDiffLines(
 fn renderVisualRow(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
+    store: store_mod.Store,
     view: tui_view.FileView,
     row: tui_view.VisualRow,
     row_index: usize,
@@ -365,9 +367,9 @@ fn renderVisualRow(
         .fold => return renderFoldRow(allocator, row, width, selected, ansi, palette),
         .stacked_code, .file_meta => {
             const line = row.line orelse return renderPanelRow(allocator, "", width, selected, ansi, palette);
-            return renderStackedCodeRow(allocator, file, line, width, line_width, selected, ansi, palette);
+            return renderStackedCodeRow(allocator, file, store, line, width, line_width, selected, ansi, palette);
         },
-        .split_code => return renderSplitCodeRow(allocator, file, row, width, line_width, selected, ansi, palette),
+        .split_code => return renderSplitCodeRow(allocator, file, store, row, width, line_width, selected, ansi, palette),
     }
 }
 
@@ -434,6 +436,7 @@ fn renderFoldRow(
 fn renderStackedCodeRow(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
+    store: store_mod.Store,
     line: *const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -450,7 +453,8 @@ fn renderStackedCodeRow(
         .delete => "|",
         else => " ",
     };
-    const raw = try std.fmt.allocPrint(allocator, "{s} {s}  {s}", .{ bar, label, highlighted });
+    const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
+    const raw = try std.fmt.allocPrint(allocator, "{s}{s} {s}  {s}", .{ bar, comment_mark, label, highlighted });
     defer allocator.free(raw);
     return styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette));
 }
@@ -458,6 +462,7 @@ fn renderStackedCodeRow(
 fn renderSplitCodeRow(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
+    store: store_mod.Store,
     row: tui_view.VisualRow,
     width: usize,
     line_width: usize,
@@ -466,16 +471,16 @@ fn renderSplitCodeRow(
     palette: theme.ThemeTokens,
 ) ![]u8 {
     if (width < 32) {
-        if (row.right) |right| return renderStackedCodeRow(allocator, file, right, width, line_width, selected, ansi, palette);
-        if (row.left) |left| return renderStackedCodeRow(allocator, file, left, width, line_width, selected, ansi, palette);
+        if (row.right) |right| return renderStackedCodeRow(allocator, file, store, right, width, line_width, selected, ansi, palette);
+        if (row.left) |left| return renderStackedCodeRow(allocator, file, store, left, width, line_width, selected, ansi, palette);
         return renderPanelRow(allocator, "", width, selected, ansi, palette);
     }
 
     const separator_width: usize = 3;
     const side_width = (width - separator_width) / 2;
-    const left = try renderSplitCell(allocator, file, row.left, side_width, line_width, selected, ansi, palette);
+    const left = try renderSplitCell(allocator, file, store, row.left, side_width, line_width, selected, ansi, palette);
     defer allocator.free(left);
-    const right = try renderSplitCell(allocator, file, row.right, width - side_width - separator_width, line_width, selected, ansi, palette);
+    const right = try renderSplitCell(allocator, file, store, row.right, width - side_width - separator_width, line_width, selected, ansi, palette);
     defer allocator.free(right);
     return std.fmt.allocPrint(allocator, "{s}{s} │ {s}{s}", .{ left, ansi.reset(), right, ansi.reset() });
 }
@@ -483,6 +488,7 @@ fn renderSplitCodeRow(
 fn renderSplitCell(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
+    store: store_mod.Store,
     maybe_line: ?*const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -495,7 +501,8 @@ fn renderSplitCell(
         defer allocator.free(label);
         const highlighted = try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
         defer allocator.free(highlighted);
-        const raw = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ label, highlighted });
+        const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
+        const raw = try std.fmt.allocPrint(allocator, "{s} {s}  {s}", .{ comment_mark, label, highlighted });
         defer allocator.free(raw);
         return styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette));
     }
@@ -546,12 +553,34 @@ fn reapplyStyleAfterResets(
 }
 
 fn rowBg(selected: bool, kind: diff.DiffLineKind, palette: theme.ThemeTokens) theme.Color {
-    if (selected) return palette.bg_selected;
+    if (selected) {
+        return switch (kind) {
+            .add => .{ .hex = "#285343" },
+            .delete => .{ .hex = "#562932" },
+            else => palette.bg_selected,
+        };
+    }
     return switch (kind) {
         .add => palette.diff_add_bg,
         .delete => palette.diff_del_bg,
         else => palette.bg_default,
     };
+}
+
+fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff.DiffLine) bool {
+    const line_number = switch (line.kind) {
+        .delete => line.old_lineno,
+        .add => line.new_lineno,
+        .context => line.new_lineno orelse line.old_lineno,
+        .meta => null,
+    } orelse return false;
+    const side = if (line.kind == .delete) "old" else "new";
+    for (store.comments) |comment| {
+        if (!util.eql(comment.file_path, file.path)) continue;
+        if (comment.start_line != line_number) continue;
+        if (util.eql(comment.side, side) or line.kind == .context) return true;
+    }
+    return false;
 }
 
 fn rowFg(kind: diff.DiffLineKind, palette: theme.ThemeTokens) theme.Color {
@@ -937,6 +966,11 @@ test "parse sgr mouse wheel" {
     try std.testing.expect(event.isWheelDown());
     try std.testing.expectEqual(@as(usize, 10), event.x);
     try std.testing.expectEqual(@as(usize, 5), event.y);
+}
+
+test "layout body fills rows between status and footer" {
+    const layout = Layout.init(.{ .width = 100, .height = 20 });
+    try std.testing.expectEqual(@as(usize, 18), layout.body_height);
 }
 
 test "file tree start avoids unsigned underflow at first scroll row" {
