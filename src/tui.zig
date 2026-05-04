@@ -18,6 +18,7 @@ const State = struct {
     mode: DiffMode = .stacked,
     selection_start: ?usize = null,
     help: bool = false,
+    pending_g: bool = false,
     folds: std.ArrayList(tui_view.FoldEntry) = .empty,
     syntax_cache: syntax_cache.SyntaxCache,
 
@@ -153,6 +154,7 @@ fn handleEvent(
 ) !bool {
     switch (event) {
         .mouse => |mouse| {
+            state.pending_g = false;
             try handleMouse(allocator, snapshot.*, state, mouse);
             return false;
         },
@@ -161,7 +163,26 @@ fn handleEvent(
             if (key[0] == 'q') return true;
             if (state.help and key[0] != '?') {
                 state.help = false;
+                state.pending_g = false;
                 return false;
+            }
+
+            switch (gotoAction(key, state.pending_g)) {
+                .none => state.pending_g = false,
+                .pending => {
+                    state.pending_g = true;
+                    return false;
+                },
+                .top => {
+                    state.pending_g = false;
+                    try jumpToEdge(allocator, snapshot.*, state, .top);
+                    return false;
+                },
+                .bottom => {
+                    state.pending_g = false;
+                    try jumpToEdge(allocator, snapshot.*, state, .bottom);
+                    return false;
+                },
             }
 
             if (std.mem.eql(u8, key, "\x1b[A")) {
@@ -300,11 +321,11 @@ fn render(
     }
 
     if (state.help) {
-        try tui_text.appendCell(allocator, &out, "j/k arrows move  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  u unreviewed  ? help  q quit", layout.width);
+        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  u unreviewed  ? help  q quit", layout.width);
     } else {
         const active_file = snapshot.files[state.active_file];
         const syntax_mode = activeSyntaxMode(snapshot, active_file);
-        const footer = try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) });
+        const footer = try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  G/gg bottom/top  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) });
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
     }
@@ -1004,6 +1025,41 @@ fn scrollLines(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     try ensureCursorVisible(allocator, snapshot, view, state);
 }
 
+const GotoEdge = enum {
+    top,
+    bottom,
+};
+
+const GotoAction = enum {
+    none,
+    pending,
+    top,
+    bottom,
+};
+
+fn gotoAction(key: []const u8, pending_g: bool) GotoAction {
+    if (key.len == 0) return .none;
+    if (key[0] == 'G') return .bottom;
+    if (key[0] != 'g') return .none;
+    if (pending_g or (key.len >= 2 and key[1] == 'g')) return .top;
+    return .pending;
+}
+
+fn jumpToEdge(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, edge: GotoEdge) !void {
+    var view = try currentView(allocator, snapshot, state);
+    defer view.deinit(allocator);
+    if (view.rows.len == 0) {
+        state.cursor_row = 0;
+        state.scroll_row = 0;
+        return;
+    }
+    state.cursor_row = switch (edge) {
+        .top => 0,
+        .bottom => view.rows.len - 1,
+    };
+    try ensureCursorVisible(allocator, snapshot, view, state);
+}
+
 fn moveFile(snapshot: diff.DiffSnapshot, state: *State, delta: isize) void {
     if (snapshot.files.len == 0) return;
     state.active_file = moveIndex(state.active_file, snapshot.files.len, delta);
@@ -1482,6 +1538,14 @@ test "file tree start avoids unsigned underflow at first scroll row" {
     try std.testing.expectEqual(@as(usize, 0), fileTreeStartIndex(20, 0, 5));
     try std.testing.expectEqual(@as(usize, 0), fileTreeStartIndex(20, 3, 5));
     try std.testing.expectEqual(@as(usize, 1), fileTreeStartIndex(20, 4, 5));
+}
+
+test "goto action tracks gg prefix and G edge jump" {
+    try std.testing.expectEqual(GotoAction.pending, gotoAction("g", false));
+    try std.testing.expectEqual(GotoAction.top, gotoAction("g", true));
+    try std.testing.expectEqual(GotoAction.top, gotoAction("gg", false));
+    try std.testing.expectEqual(GotoAction.bottom, gotoAction("G", false));
+    try std.testing.expectEqual(GotoAction.none, gotoAction("j", true));
 }
 
 test "fold target falls back to nearby fold row" {

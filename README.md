@@ -87,6 +87,7 @@ When stdout is not a TTY, `diffo` renders a static diff screen instead of enteri
 | --- | --- |
 | `j` / `k` | Move down / up within the current file diff |
 | `↑` / `↓` | Move down / up within the current file diff |
+| `G` / `gg` | 跳到当前文件 diff 的底部 / 顶部 |
 | `PageUp` / `PageDown` | Scroll by a larger step |
 | `J` / `K` | Move to next / previous file |
 | `n` / `N` | Jump to next / previous change |
