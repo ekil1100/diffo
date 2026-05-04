@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const diff = @import("diff.zig");
+const inline_diff = @import("inline_diff.zig");
 const store_mod = @import("store.zig");
 const syntax = @import("syntax.zig");
 const syntax_cache = @import("syntax_cache.zig");
@@ -749,12 +750,25 @@ fn renderSplitCodeRows(
     const separator_width: usize = 3;
     const side_width = (width - separator_width) / 2;
     const right_width = width - side_width - separator_width;
-    const left_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.left, side_width, line_width, selected, max_lines, ansi, palette);
+    const empty_inline_ranges: []const inline_diff.Range = &.{};
+    var pair_ranges: ?inline_diff.PairRanges = null;
+    if (row.left) |left| {
+        if (row.right) |right| {
+            if (left.kind == .delete and right.kind == .add) {
+                pair_ranges = try inline_diff.diffRanges(allocator, left.text, right.text);
+            }
+        }
+    }
+    defer if (pair_ranges) |*ranges| ranges.deinit(allocator);
+    const left_inline_ranges = if (pair_ranges) |ranges| ranges.old else empty_inline_ranges;
+    const right_inline_ranges = if (pair_ranges) |ranges| ranges.new else empty_inline_ranges;
+
+    const left_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.left, side_width, line_width, selected, max_lines, left_inline_ranges, ansi, palette);
     defer {
         for (left_rows) |line| allocator.free(line);
         allocator.free(left_rows);
     }
-    const right_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.right, right_width, line_width, selected, max_lines, ansi, palette);
+    const right_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.right, right_width, line_width, selected, max_lines, right_inline_ranges, ansi, palette);
     defer {
         for (right_rows) |line| allocator.free(line);
         allocator.free(right_rows);
@@ -789,7 +803,7 @@ fn renderSplitCell(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
-    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, maybe_line, width, line_width, selected, 1, ansi, palette);
+    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, maybe_line, width, line_width, selected, 1, &.{}, ansi, palette);
     defer allocator.free(rows);
     return rows[0];
 }
@@ -805,6 +819,7 @@ fn renderSplitCellRows(
     line_width: usize,
     selected: bool,
     max_lines: usize,
+    inline_ranges: []const inline_diff.Range,
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![][]u8 {
@@ -815,13 +830,15 @@ fn renderSplitCellRows(
         const highlighted = state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch
             try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
         defer allocator.free(highlighted);
+        const inline_highlighted = try applyInlineRanges(allocator, highlighted, line.text, inline_ranges, ansi, rowBg(selected, line.kind, palette), inlineBg(selected, line.kind, palette));
+        defer allocator.free(inline_highlighted);
         const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
         const prefix = try std.fmt.allocPrint(allocator, "{s} {s}  ", .{ comment_mark, label });
         defer allocator.free(prefix);
         const wrap_widths = lineWrapWidths(width, prefix.len, line.text);
         const continuation_prefix = try blankLabel(allocator, wrap_widths.continuation_prefix);
         defer allocator.free(continuation_prefix);
-        const wrapped = try wrapAnsiTextWithWidths(allocator, highlighted, wrap_widths.first, wrap_widths.continuation, max_lines);
+        const wrapped = try wrapAnsiTextWithWidths(allocator, inline_highlighted, wrap_widths.first, wrap_widths.continuation, max_lines);
         defer {
             for (wrapped) |segment| allocator.free(segment);
             allocator.free(wrapped);
@@ -897,6 +914,89 @@ fn rowBg(selected: bool, kind: diff.DiffLineKind, palette: theme.ThemeTokens) th
         .delete => palette.diff_del_bg,
         else => palette.bg_default,
     };
+}
+
+fn inlineBg(selected: bool, kind: diff.DiffLineKind, palette: theme.ThemeTokens) theme.Color {
+    _ = palette;
+    if (selected) {
+        return switch (kind) {
+            .add => .{ .hex = "#3c7a5a" },
+            .delete => .{ .hex = "#874151" },
+            else => .{ .hex = "#45475a" },
+        };
+    }
+    return switch (kind) {
+        .add => .{ .hex = "#2f6f4f" },
+        .delete => .{ .hex = "#74303d" },
+        else => .{ .hex = "#45475a" },
+    };
+}
+
+fn applyInlineRanges(
+    allocator: std.mem.Allocator,
+    highlighted: []const u8,
+    source_text: []const u8,
+    ranges: []const inline_diff.Range,
+    ansi: theme.Ansi,
+    base_bg: theme.Color,
+    inline_bg: theme.Color,
+) ![]u8 {
+    if (ranges.len == 0 or !ansi.enabled or !ansi.true_color) return util.dupe(allocator, highlighted);
+
+    const base_bg_code = try ansi.bg(allocator, base_bg);
+    defer allocator.free(base_bg_code);
+    const inline_bg_code = try ansi.bg(allocator, inline_bg);
+    defer allocator.free(inline_bg_code);
+    if (inline_bg_code.len == 0) return util.dupe(allocator, highlighted);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const reset = ansi.reset();
+    var source_offset: usize = 0;
+    var range_index: usize = 0;
+    var active = false;
+    var i: usize = 0;
+    while (i < highlighted.len) {
+        if (highlighted[i] == '\x1b') {
+            const start = i;
+            i += 1;
+            while (i < highlighted.len and highlighted[i] != 'm') : (i += 1) {}
+            if (i < highlighted.len) i += 1;
+            const sequence = highlighted[start..i];
+            try out.appendSlice(allocator, sequence);
+            if (active and std.mem.eql(u8, sequence, reset)) try out.appendSlice(allocator, inline_bg_code);
+            continue;
+        }
+
+        while (range_index < ranges.len and source_offset >= ranges[range_index].end) {
+            if (active) {
+                try out.appendSlice(allocator, base_bg_code);
+                active = false;
+            }
+            range_index += 1;
+        }
+        if (!active and range_index < ranges.len and source_offset >= ranges[range_index].start and source_offset < ranges[range_index].end) {
+            try out.appendSlice(allocator, inline_bg_code);
+            active = true;
+        }
+
+        const seq_len = tui_text.utf8SeqLen(highlighted[i]);
+        const end = if (i + seq_len <= highlighted.len) i + seq_len else i + 1;
+        try out.appendSlice(allocator, highlighted[i..end]);
+        if (source_offset < source_text.len) source_offset += end - i;
+        i = end;
+
+        while (range_index < ranges.len and source_offset >= ranges[range_index].end) {
+            if (active) {
+                try out.appendSlice(allocator, base_bg_code);
+                active = false;
+            }
+            range_index += 1;
+        }
+    }
+    if (active) try out.appendSlice(allocator, base_bg_code);
+    return out.toOwnedSlice(allocator);
 }
 
 fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff.DiffLine) bool {
@@ -1478,6 +1578,30 @@ test "wrap ansi text ignores color escapes in visible width" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("\x1b[31mabc", rows[0]);
     try std.testing.expectEqualStrings("def\x1b[0m", rows[1]);
+}
+
+test "inline range background survives syntax resets" {
+    const allocator = std.testing.allocator;
+    const ansi = theme.Ansi{ .enabled = true, .true_color = true };
+    const base_bg: theme.Color = .{ .hex = "#1e3a2f" };
+    const inline_bg: theme.Color = .{ .hex = "#2f6f4f" };
+    const inline_code = try ansi.bg(allocator, inline_bg);
+    defer allocator.free(inline_code);
+
+    const rendered = try applyInlineRanges(
+        allocator,
+        "\x1b[38;2;1;2;3mold\x1b[0mValue",
+        "oldValue",
+        &.{.{ .start = 0, .end = 8 }},
+        ansi,
+        base_bg,
+        inline_bg,
+    );
+    defer allocator.free(rendered);
+
+    const first = std.mem.indexOf(u8, rendered, inline_code) orelse return error.TestExpectedEqual;
+    const last = std.mem.lastIndexOf(u8, rendered, inline_code) orelse return error.TestExpectedEqual;
+    try std.testing.expect(last > first);
 }
 
 test "wrap ansi text supports narrower continuation rows" {

@@ -1,6 +1,7 @@
 pub const cli = @import("cli.zig");
 pub const diff = @import("diff.zig");
 pub const git = @import("git.zig");
+pub const inline_diff = @import("inline_diff.zig");
 pub const store = @import("store.zig");
 pub const syntax = @import("syntax.zig");
 pub const syntax_cache = @import("syntax_cache.zig");
@@ -17,6 +18,7 @@ test {
     _ = cli;
     _ = diff;
     _ = git;
+    _ = inline_diff;
     _ = store;
     _ = syntax;
     _ = syntax_cache;
