@@ -17,7 +17,7 @@ The project is implemented in Zig and targets Zig `0.16.0`.
 - Store state outside the repository using XDG state paths.
 - Use Catppuccin Mocha as the built-in default theme.
 - Validate Base16/Base24 theme files.
-- Apply lightweight syntax highlighting when terminal color support is available. Tree-sitter is kept as an implementation boundary, but grammars are not bundled yet.
+- Apply syntax highlighting when terminal color support is available. A bundled Tree-sitter Zig grammar is used for Zig files, with lightweight lexical fallback for unsupported languages or unavailable source sides.
 
 ## Requirements
 
@@ -239,7 +239,7 @@ Writes use a temporary file followed by rename, so interrupted writes should not
 
 ## Current V1 Limits
 
-- Tree-sitter grammar loading is not bundled yet; syntax highlighting currently uses a lightweight fallback.
+- Tree-sitter highlighting is currently bundled for Zig files only; unsupported languages, explicit targets, large files, and unavailable source sides fall back to lightweight lexical highlighting.
 - Comment relocation is minimal: comments become `stale` when the patch fingerprint changes.
 - Runtime theme switching and full config loading are not implemented yet.
 - Mouse support covers click selection and scroll wheel navigation; richer filtering/search can be added later.

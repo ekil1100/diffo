@@ -9,6 +9,11 @@ pub const GitError = error{
     GitCommandFailed,
 } || std.mem.Allocator.Error || diff.ParseError;
 
+pub const FileSide = enum {
+    old,
+    new,
+};
+
 pub const GitRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -327,4 +332,64 @@ pub fn statusList(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u
     const result = try runner.run(args);
     allocator.free(result.stderr);
     return result.stdout;
+}
+
+pub fn loadFileSide(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: diff.Repository,
+    target: diff.ReviewTarget,
+    file: diff.DiffFile,
+    side: FileSide,
+    debug: bool,
+) GitError!?[]u8 {
+    if (file.is_binary) return null;
+    if (target.kind != .working_tree) return null;
+    const runner = GitRunner{ .allocator = allocator, .io = io, .repo_root = repo.root_path, .debug = debug };
+    return switch (file.source) {
+        .unstaged => switch (side) {
+            .old => try readIndexBlob(allocator, runner, file.old_path orelse file.path),
+            .new => try readWorktreeFile(allocator, io, repo.root_path, file.path),
+        },
+        .staged => switch (side) {
+            .old => try readHeadBlob(allocator, runner, file.old_path orelse file.path),
+            .new => try readIndexBlob(allocator, runner, file.path),
+        },
+        .untracked => switch (side) {
+            .old => null,
+            .new => try readWorktreeFile(allocator, io, repo.root_path, file.path),
+        },
+        .explicit => null,
+    };
+}
+
+fn readHeadBlob(allocator: std.mem.Allocator, runner: GitRunner, path: []const u8) GitError!?[]u8 {
+    const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{path});
+    defer allocator.free(spec);
+    return readGitBlob(allocator, runner, spec);
+}
+
+fn readIndexBlob(allocator: std.mem.Allocator, runner: GitRunner, path: []const u8) GitError!?[]u8 {
+    const spec = try std.fmt.allocPrint(allocator, ":{s}", .{path});
+    defer allocator.free(spec);
+    return readGitBlob(allocator, runner, spec);
+}
+
+fn readGitBlob(allocator: std.mem.Allocator, runner: GitRunner, spec: []const u8) GitError!?[]u8 {
+    const result = runner.run(&.{ "show", spec }) catch |err| switch (err) {
+        error.GitCommandFailed => return null,
+        else => return err,
+    };
+    allocator.free(result.stderr);
+    return result.stdout;
+}
+
+fn readWorktreeFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) GitError!?[]u8 {
+    const absolute = try std.fs.path.join(allocator, &.{ repo_root, path });
+    defer allocator.free(absolute);
+    const max_source_bytes = 4 * 1024 * 1024;
+    return std.Io.Dir.cwd().readFileAlloc(io, absolute, allocator, .limited(max_source_bytes)) catch |err| switch (err) {
+        error.StreamTooLong, error.FileNotFound, error.AccessDenied => null,
+        else => error.GitCommandFailed,
+    };
 }

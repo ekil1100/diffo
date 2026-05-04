@@ -1,4 +1,5 @@
 const std = @import("std");
+const syntax_grammars = @import("syntax_grammars.zig");
 const theme = @import("theme.zig");
 const util = @import("util.zig");
 
@@ -6,6 +7,23 @@ pub const HighlightMode = enum {
     tree_sitter,
     lexical_fallback,
     disabled,
+};
+
+pub const SyntaxToken = enum {
+    keyword,
+    string,
+    comment,
+    type,
+    function,
+    number,
+    operator,
+    plain,
+};
+
+pub const HighlightSpan = struct {
+    start_byte: usize,
+    end_byte: usize,
+    token: SyntaxToken,
 };
 
 pub const Config = struct {
@@ -21,8 +39,51 @@ pub const RegistryStatus = struct {
 
 pub fn registryStatus() RegistryStatus {
     return .{
-        .mode = .lexical_fallback,
-        .detail = "Tree-sitter adapter is present as a boundary, but no grammars are bundled; lexical syntax highlighting is used and diff semantic highlighting remains authoritative.",
+        .mode = .tree_sitter,
+        .detail = "Tree-sitter syntax highlighting is available for bundled Zig grammar; unsupported languages and failures use lexical fallback.",
+    };
+}
+
+pub fn modeForLanguage(language: ?[]const u8) HighlightMode {
+    const lang = language orelse return .lexical_fallback;
+    return if (syntax_grammars.find(lang) != null) .tree_sitter else .lexical_fallback;
+}
+
+pub fn renderHighlightedLine(
+    allocator: std.mem.Allocator,
+    ansi: theme.Ansi,
+    tokens: theme.ThemeTokens,
+    text: []const u8,
+    spans: []const HighlightSpan,
+) ![]u8 {
+    if (!ansi.enabled or spans.len == 0) return util.dupe(allocator, text);
+    var out: std.ArrayList(u8) = .empty;
+    var cursor: usize = 0;
+    for (spans) |span| {
+        if (span.end_byte <= cursor or span.start_byte >= text.len or span.end_byte > text.len or span.start_byte >= span.end_byte) continue;
+        const start = @max(cursor, span.start_byte);
+        if (cursor < start) try out.appendSlice(allocator, text[cursor..start]);
+        const color = try ansi.fg(allocator, colorForToken(tokens, span.token));
+        defer allocator.free(color);
+        try out.appendSlice(allocator, color);
+        try out.appendSlice(allocator, text[start..span.end_byte]);
+        try out.appendSlice(allocator, ansi.reset());
+        cursor = span.end_byte;
+    }
+    if (cursor < text.len) try out.appendSlice(allocator, text[cursor..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn colorForToken(tokens: theme.ThemeTokens, token: SyntaxToken) theme.Color {
+    return switch (token) {
+        .keyword => tokens.syntax_keyword,
+        .string => tokens.syntax_string,
+        .comment => tokens.syntax_comment,
+        .type => tokens.syntax_type,
+        .function => tokens.syntax_function,
+        .number => tokens.syntax_number,
+        .operator => tokens.syntax_operator,
+        .plain => tokens.syntax_plain,
     };
 }
 
@@ -124,5 +185,22 @@ fn keywordsFor(language: []const u8) []const []const u8 {
 }
 
 test "registry has graceful fallback" {
-    try std.testing.expectEqual(HighlightMode.lexical_fallback, registryStatus().mode);
+    try std.testing.expectEqual(HighlightMode.tree_sitter, registryStatus().mode);
+}
+
+test "language mode reports fallback for unsupported languages" {
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("zig"));
+    try std.testing.expectEqual(HighlightMode.lexical_fallback, modeForLanguage("markdown"));
+    try std.testing.expectEqual(HighlightMode.lexical_fallback, modeForLanguage(null));
+}
+
+test "render highlighted line emits token color" {
+    const allocator = std.testing.allocator;
+    const ansi = theme.Ansi{ .enabled = true, .true_color = true };
+    const rendered = try renderHighlightedLine(allocator, ansi, theme.catppuccinMocha(), "const value = 1", &.{
+        .{ .start_byte = 0, .end_byte = 5, .token = .keyword },
+    });
+    defer allocator.free(rendered);
+    try std.testing.expect(util.contains(rendered, "\x1b[38;2;"));
+    try std.testing.expect(util.contains(rendered, "const"));
 }

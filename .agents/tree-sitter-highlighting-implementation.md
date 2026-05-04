@@ -6,7 +6,7 @@
 - 文档类型：实现方案
 - 目标实现语言：Zig 0.16.0
 - 适用范围：语法高亮、TUI 渲染、构建系统、主题映射、测试
-- 当前状态：`src/syntax.zig` 已有轻量 lexical fallback，Tree-sitter 作为边界存在但未接入 grammar
+- 当前状态：第一版已接入 vendored Tree-sitter runtime 和 Zig grammar；Zig 文件优先使用 Tree-sitter highlight query，其他语言和不可用 source side 回退到 lexical fallback
 
 ## 2. 背景与目标
 

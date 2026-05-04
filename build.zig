@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    addSyntaxNativeSources(b, mod);
 
     const exe = b.addExecutable(.{
         .name = "diffo",
@@ -43,4 +44,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn addSyntaxNativeSources(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-zig/src"));
+    module.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &.{ "-std=c11", "-O2" },
+    });
+    module.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter-zig/src/parser.c"),
+        .flags = &.{ "-std=c11", "-O2" },
+    });
 }

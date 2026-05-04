@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const diff = @import("diff.zig");
 const store_mod = @import("store.zig");
 const syntax = @import("syntax.zig");
+const syntax_cache = @import("syntax_cache.zig");
 const theme = @import("theme.zig");
 const tui_text = @import("tui_text.zig");
 const tui_view = @import("tui_view.zig");
@@ -18,9 +19,17 @@ const State = struct {
     selection_start: ?usize = null,
     help: bool = false,
     folds: std.ArrayList(tui_view.FoldEntry) = .empty,
+    syntax_cache: syntax_cache.SyntaxCache,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.DiffSnapshot) State {
+        return .{
+            .syntax_cache = syntax_cache.SyntaxCache.init(allocator, io, snapshot.repository, snapshot.review_target, false),
+        };
+    }
 
     fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.folds.deinit(allocator);
+        self.syntax_cache.deinit();
     }
 };
 
@@ -99,10 +108,10 @@ pub fn run(
         return;
     }
 
-    var state = State{};
+    var state = State.init(allocator, io, snapshot.*);
     defer state.deinit(allocator);
     if (builtin.os.tag == .windows) {
-        const screen = try render(allocator, snapshot.*, store.*, state, false);
+        const screen = try render(allocator, snapshot.*, store.*, &state, false);
         defer allocator.free(screen);
         try writeAll(io, screen);
         return;
@@ -110,7 +119,7 @@ pub fn run(
 
     const is_tty = (std.Io.File.stdout().isTty(io) catch false) and (std.Io.File.stdin().isTty(io) catch false);
     if (!is_tty) {
-        const screen = try render(allocator, snapshot.*, store.*, state, false);
+        const screen = try render(allocator, snapshot.*, store.*, &state, false);
         defer allocator.free(screen);
         try writeAll(io, screen);
         return;
@@ -123,7 +132,7 @@ pub fn run(
     defer writeAll(io, "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l") catch {};
 
     while (true) {
-        const screen = try render(allocator, snapshot.*, store.*, state, true);
+        const screen = try render(allocator, snapshot.*, store.*, &state, true);
         defer allocator.free(screen);
         try writeAll(io, screen);
 
@@ -198,7 +207,7 @@ fn handleEvent(
                     try writeAll(io, "\x1b[?25h\x1b[2K\rcomment: ");
                     const body = try readLine(allocator);
                     defer allocator.free(body);
-                    if (body.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state.*, body, author);
+                    if (body.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state, body, author);
                     raw.* = RawTerminal.enter() catch null;
                     try writeAll(io, "\x1b[?25l");
                     state.selection_start = null;
@@ -241,8 +250,8 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
         defer view.deinit(allocator);
         const total = view.rows.len;
         if (total == 0) return;
-        state.cursor_row = @min(state.scroll_row + mouse.y - layout.body_y, total - 1);
-        ensureCursorVisible(view, state);
+        state.cursor_row = try rowAtVisualOffset(allocator, snapshot, state, view, mouse.y - layout.body_y, layout);
+        try ensureCursorVisible(allocator, snapshot, view, state);
     }
 }
 
@@ -250,15 +259,16 @@ fn render(
     allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     store: store_mod.Store,
-    state: State,
+    state: *State,
     colors: bool,
 ) ![]u8 {
     const layout = Layout.init(terminalSize());
     const palette = theme.catppuccinMocha();
     const ansi = theme.Ansi.init(colors);
     const clear_eol = if (colors) "\x1b[K" else "";
-    var view = try currentView(allocator, snapshot, &state);
+    var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
+    try ensureCursorVisible(allocator, snapshot, view, state);
 
     var out: std.ArrayList(u8) = .empty;
     if (colors) try out.appendSlice(allocator, "\x1b[?2026h\x1b[H");
@@ -266,7 +276,7 @@ fn render(
     try out.appendSlice(allocator, clear_eol);
     try out.append(allocator, '\n');
 
-    const diff_lines = try renderDiffLines(allocator, snapshot.files[state.active_file], store, view, state, layout.main_width, layout.body_height, ansi, palette);
+    const diff_lines = try renderDiffLines(allocator, state, snapshot.files[state.active_file], state.active_file, store, view, layout.main_width, layout.body_height, ansi, palette);
     defer {
         for (diff_lines) |line| allocator.free(line);
         allocator.free(diff_lines);
@@ -292,8 +302,9 @@ fn render(
     if (state.help) {
         try tui_text.appendCell(allocator, &out, "j/k arrows move  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  u unreviewed  ? help  q quit", layout.width);
     } else {
-        const status = syntax.registryStatus();
-        const footer = try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(status.mode) });
+        const active_file = snapshot.files[state.active_file];
+        const syntax_mode = activeSyntaxMode(snapshot, active_file);
+        const footer = try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) });
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
     }
@@ -301,7 +312,7 @@ fn render(
     return out.toOwnedSlice(allocator);
 }
 
-fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot: diff.DiffSnapshot, store: store_mod.Store, state: State, width: usize) !void {
+fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *const State, width: usize) !void {
     var reviewed: usize = 0;
     for (snapshot.files) |file| {
         if (store.isReviewed(file.path, file.patch_fingerprint, snapshot.review_target.target_id)) reviewed += 1;
@@ -310,6 +321,11 @@ fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot:
     const line = try std.fmt.allocPrint(allocator, " diffo  {s}  {s}  files {d}/{d} reviewed  file {d}/{d}  {s}", .{ snapshot.repository.current_branch, snapshot.review_target.normalized_spec, reviewed, snapshot.files.len, state.active_file + 1, snapshot.files.len, file.path });
     defer allocator.free(line);
     try tui_text.appendCell(allocator, out, line, width);
+}
+
+fn activeSyntaxMode(snapshot: diff.DiffSnapshot, file: diff.DiffFile) syntax.HighlightMode {
+    if (file.is_binary or snapshot.review_target.kind != .working_tree) return .lexical_fallback;
+    return syntax.modeForLanguage(file.language);
 }
 
 fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
@@ -322,10 +338,11 @@ fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tex
 
 fn renderDiffLines(
     allocator: std.mem.Allocator,
+    state: *State,
     file: diff.DiffFile,
+    file_index: usize,
     store: store_mod.Store,
     view: tui_view.FileView,
-    state: State,
     width: usize,
     height: usize,
     ansi: theme.Ansi,
@@ -341,36 +358,48 @@ fn renderDiffLines(
     const end = @min(total, start + height);
     const line_width = lineNumberWidth(file);
     for (start..end) |row_index| {
-        const rendered = try renderVisualRow(allocator, file, store, view, view.rows[row_index], row_index, state, width, line_width, ansi, palette);
-        try lines.append(allocator, rendered);
+        if (lines.items.len >= height) break;
+        const rendered = try renderVisualRowLines(allocator, state, file, file_index, store, view, view.rows[row_index], row_index, width, line_width, height - lines.items.len, ansi, palette);
+        defer allocator.free(rendered);
+        for (rendered) |line| try lines.append(allocator, line);
     }
     return lines.toOwnedSlice(allocator);
 }
 
-fn renderVisualRow(
+fn renderVisualRowLines(
     allocator: std.mem.Allocator,
+    state: *State,
     file: diff.DiffFile,
+    file_index: usize,
     store: store_mod.Store,
     view: tui_view.FileView,
     row: tui_view.VisualRow,
     row_index: usize,
-    state: State,
     width: usize,
     line_width: usize,
+    max_lines: usize,
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
-) ![]u8 {
+) ![][]u8 {
     const selected = isSelected(state, row_index);
+    if (max_lines == 0) return allocator.alloc([]u8, 0);
     switch (row.kind) {
-        .file_header => return renderFileHeader(allocator, file, view, width, ansi, palette),
-        .hunk_header => return renderPanelRow(allocator, row.hunk_header orelse "", width, selected, ansi, palette),
-        .fold => return renderFoldRow(allocator, row, width, selected, ansi, palette),
+        .file_header => return oneRenderedLine(allocator, try renderFileHeader(allocator, file, view, width, ansi, palette)),
+        .hunk_header => return oneRenderedLine(allocator, try renderPanelRow(allocator, row.hunk_header orelse "", width, selected, ansi, palette)),
+        .fold => return oneRenderedLine(allocator, try renderFoldRow(allocator, row, width, selected, ansi, palette)),
         .stacked_code, .file_meta => {
-            const line = row.line orelse return renderPanelRow(allocator, "", width, selected, ansi, palette);
-            return renderStackedCodeRow(allocator, file, store, line, width, line_width, selected, ansi, palette);
+            const line = row.line orelse return oneRenderedLine(allocator, try renderPanelRow(allocator, "", width, selected, ansi, palette));
+            return renderStackedCodeRows(allocator, state, file, file_index, store, line, width, line_width, selected, max_lines, ansi, palette);
         },
-        .split_code => return renderSplitCodeRow(allocator, file, store, row, width, line_width, selected, ansi, palette),
+        .split_code => return renderSplitCodeRows(allocator, state, file, file_index, store, row, width, line_width, selected, max_lines, ansi, palette),
     }
+}
+
+fn oneRenderedLine(allocator: std.mem.Allocator, line: []u8) ![][]u8 {
+    errdefer allocator.free(line);
+    const lines = try allocator.alloc([]u8, 1);
+    lines[0] = line;
+    return lines;
 }
 
 fn renderFileHeader(
@@ -435,7 +464,9 @@ fn renderFoldRow(
 
 fn renderStackedCodeRow(
     allocator: std.mem.Allocator,
+    state: *State,
     file: diff.DiffFile,
+    file_index: usize,
     store: store_mod.Store,
     line: *const diff.DiffLine,
     width: usize,
@@ -444,9 +475,29 @@ fn renderStackedCodeRow(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
+    const rows = try renderStackedCodeRows(allocator, state, file, file_index, store, line, width, line_width, selected, 1, ansi, palette);
+    defer allocator.free(rows);
+    return rows[0];
+}
+
+fn renderStackedCodeRows(
+    allocator: std.mem.Allocator,
+    state: *State,
+    file: diff.DiffFile,
+    file_index: usize,
+    store: store_mod.Store,
+    line: *const diff.DiffLine,
+    width: usize,
+    line_width: usize,
+    selected: bool,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![][]u8 {
     const label = try lineLabel(allocator, line, line_width);
     defer allocator.free(label);
-    const highlighted = try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
+    const highlighted = state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch
+        try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
     defer allocator.free(highlighted);
     const bar = switch (line.kind) {
         .add => "|",
@@ -454,14 +505,192 @@ fn renderStackedCodeRow(
         else => " ",
     };
     const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
-    const raw = try std.fmt.allocPrint(allocator, "{s}{s} {s}  {s}", .{ bar, comment_mark, label, highlighted });
-    defer allocator.free(raw);
-    return styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette));
+    const prefix = try std.fmt.allocPrint(allocator, "{s}{s} {s}  ", .{ bar, comment_mark, label });
+    defer allocator.free(prefix);
+    const wrap_widths = lineWrapWidths(width, prefix.len, line.text);
+    const continuation_prefix = try blankLabel(allocator, wrap_widths.continuation_prefix);
+    defer allocator.free(continuation_prefix);
+    const wrapped = try wrapAnsiTextWithWidths(allocator, highlighted, wrap_widths.first, wrap_widths.continuation, max_lines);
+    defer {
+        for (wrapped) |segment| allocator.free(segment);
+        allocator.free(wrapped);
+    }
+    var rows: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (rows.items) |row| allocator.free(row);
+        rows.deinit(allocator);
+    }
+    for (wrapped, 0..) |segment, i| {
+        const raw = try std.fmt.allocPrint(allocator, "{s}{s}", .{ if (i == 0) prefix else continuation_prefix, segment });
+        defer allocator.free(raw);
+        try rows.append(allocator, try styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette)));
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
+fn continuationPrefixWidth(row_width: usize, prefix_width: usize, code_indent_width: usize) usize {
+    if (row_width <= prefix_width + 1) return prefix_width;
+    return @min(row_width - 1, prefix_width + code_indent_width + 1);
+}
+
+const WrapWidths = struct {
+    first: usize,
+    continuation: usize,
+    continuation_prefix: usize,
+};
+
+fn lineWrapWidths(row_width: usize, prefix_width: usize, text: []const u8) WrapWidths {
+    const continuation_prefix = continuationPrefixWidth(row_width, prefix_width, codeIndentWidth(text));
+    return .{
+        .first = if (row_width > prefix_width) row_width - prefix_width else 1,
+        .continuation = if (row_width > continuation_prefix) row_width - continuation_prefix else 1,
+        .continuation_prefix = continuation_prefix,
+    };
+}
+
+fn codeIndentWidth(text: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == ' ') {
+            width += 1;
+            i += 1;
+            continue;
+        }
+        if (text[i] == '\t') {
+            width += 4;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    return width;
+}
+
+fn wrapAnsiText(allocator: std.mem.Allocator, text: []const u8, width: usize, max_lines: usize) ![][]u8 {
+    return wrapAnsiTextWithWidths(allocator, text, width, width, max_lines);
+}
+
+fn wrapAnsiTextWithWidths(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    first_width: usize,
+    continuation_width: usize,
+    max_lines: usize,
+) ![][]u8 {
+    if (max_lines == 0) return allocator.alloc([]u8, 0);
+    var lines: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    var current: std.ArrayList(u8) = .empty;
+    errdefer current.deinit(allocator);
+    var visible: usize = 0;
+    var seen_non_space = false;
+    var previous_was_space = false;
+    var last_break: ?struct {
+        line_end: usize,
+        carry_start: usize,
+        carry_visible_start: usize,
+    } = null;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\x1b') {
+            const start = i;
+            i += 1;
+            while (i < text.len and text[i] != 'm') : (i += 1) {}
+            if (i < text.len) i += 1;
+            try current.appendSlice(allocator, text[start..i]);
+            continue;
+        }
+
+        const seq_len = tui_text.utf8SeqLen(text[i]);
+        if (i + seq_len > text.len) break;
+        const char_width = @max(tui_text.displayWidth(text[i .. i + seq_len]), 1);
+        const current_width = if (lines.items.len == 0) first_width else continuation_width;
+        if (visible > 0 and visible + char_width > current_width) {
+            if (lines.items.len + 1 == max_lines) {
+                try current.appendSlice(allocator, text[i..]);
+                i = text.len;
+                break;
+            }
+            if (last_break) |breakpoint| {
+                if (breakpoint.line_end > 0) {
+                    const line = try allocator.dupe(u8, current.items[0..breakpoint.line_end]);
+                    errdefer allocator.free(line);
+                    const carry = try allocator.dupe(u8, current.items[breakpoint.carry_start..]);
+                    defer allocator.free(carry);
+                    const carry_visible = visible - breakpoint.carry_visible_start;
+                    try lines.append(allocator, line);
+                    current.clearRetainingCapacity();
+                    try current.appendSlice(allocator, carry);
+                    visible = carry_visible;
+                    seen_non_space = carry_visible > 0;
+                    previous_was_space = false;
+                    last_break = null;
+                    continue;
+                }
+            }
+            try lines.append(allocator, try current.toOwnedSlice(allocator));
+            current = .empty;
+            visible = 0;
+            seen_non_space = false;
+            previous_was_space = false;
+            last_break = null;
+            continue;
+        }
+        try current.appendSlice(allocator, text[i .. i + seq_len]);
+        visible += char_width;
+        const is_space = seq_len == 1 and text[i] == ' ';
+        if (is_space) {
+            if (seen_non_space) {
+                const line_end = if (previous_was_space) (last_break.?.line_end) else current.items.len - seq_len;
+                last_break = .{
+                    .line_end = line_end,
+                    .carry_start = current.items.len,
+                    .carry_visible_start = visible,
+                };
+            }
+            previous_was_space = true;
+        } else if (char_width > 0) {
+            seen_non_space = true;
+            previous_was_space = false;
+        }
+        if (!is_space and seen_non_space and isCodeBreakAfterChar(text[i .. i + seq_len])) {
+            last_break = .{
+                .line_end = current.items.len,
+                .carry_start = current.items.len,
+                .carry_visible_start = visible,
+            };
+        }
+        i += seq_len;
+    }
+    if (current.items.len > 0 or lines.items.len == 0) try lines.append(allocator, try current.toOwnedSlice(allocator));
+    return lines.toOwnedSlice(allocator);
+}
+
+fn wrapAnsiTextLineCount(allocator: std.mem.Allocator, text: []const u8, first_width: usize, continuation_width: usize) !usize {
+    const rows = try wrapAnsiTextWithWidths(allocator, text, first_width, continuation_width, std.math.maxInt(usize));
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    return rows.len;
+}
+
+fn isCodeBreakAfterChar(bytes: []const u8) bool {
+    return bytes.len == 1 and switch (bytes[0]) {
+        ',', ';', ':', '=', ')', ']', '}', '{' => true,
+        else => false,
+    };
 }
 
 fn renderSplitCodeRow(
     allocator: std.mem.Allocator,
+    state: *State,
     file: diff.DiffFile,
+    file_index: usize,
     store: store_mod.Store,
     row: tui_view.VisualRow,
     width: usize,
@@ -470,24 +699,67 @@ fn renderSplitCodeRow(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
+    const rows = try renderSplitCodeRows(allocator, state, file, file_index, store, row, width, line_width, selected, 1, ansi, palette);
+    defer allocator.free(rows);
+    return rows[0];
+}
+
+fn renderSplitCodeRows(
+    allocator: std.mem.Allocator,
+    state: *State,
+    file: diff.DiffFile,
+    file_index: usize,
+    store: store_mod.Store,
+    row: tui_view.VisualRow,
+    width: usize,
+    line_width: usize,
+    selected: bool,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![][]u8 {
+    if (max_lines == 0) return allocator.alloc([]u8, 0);
     if (width < 32) {
-        if (row.right) |right| return renderStackedCodeRow(allocator, file, store, right, width, line_width, selected, ansi, palette);
-        if (row.left) |left| return renderStackedCodeRow(allocator, file, store, left, width, line_width, selected, ansi, palette);
-        return renderPanelRow(allocator, "", width, selected, ansi, palette);
+        if (row.right) |right| return renderStackedCodeRows(allocator, state, file, file_index, store, right, width, line_width, selected, max_lines, ansi, palette);
+        if (row.left) |left| return renderStackedCodeRows(allocator, state, file, file_index, store, left, width, line_width, selected, max_lines, ansi, palette);
+        return oneRenderedLine(allocator, try renderPanelRow(allocator, "", width, selected, ansi, palette));
     }
 
     const separator_width: usize = 3;
     const side_width = (width - separator_width) / 2;
-    const left = try renderSplitCell(allocator, file, store, row.left, side_width, line_width, selected, ansi, palette);
-    defer allocator.free(left);
-    const right = try renderSplitCell(allocator, file, store, row.right, width - side_width - separator_width, line_width, selected, ansi, palette);
-    defer allocator.free(right);
-    return std.fmt.allocPrint(allocator, "{s}{s} │ {s}{s}", .{ left, ansi.reset(), right, ansi.reset() });
+    const right_width = width - side_width - separator_width;
+    const left_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.left, side_width, line_width, selected, max_lines, ansi, palette);
+    defer {
+        for (left_rows) |line| allocator.free(line);
+        allocator.free(left_rows);
+    }
+    const right_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.right, right_width, line_width, selected, max_lines, ansi, palette);
+    defer {
+        for (right_rows) |line| allocator.free(line);
+        allocator.free(right_rows);
+    }
+
+    var rows: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (rows.items) |line| allocator.free(line);
+        rows.deinit(allocator);
+    }
+    const row_count = @min(max_lines, @max(left_rows.len, right_rows.len));
+    for (0..row_count) |i| {
+        const left = if (i < left_rows.len) left_rows[i] else try styleCell(allocator, "", side_width, ansi, rowBg(selected, .context, palette), rowFg(.context, palette));
+        defer if (i >= left_rows.len) allocator.free(left);
+        const right = if (i < right_rows.len) right_rows[i] else try styleCell(allocator, "", right_width, ansi, rowBg(selected, .context, palette), rowFg(.context, palette));
+        defer if (i >= right_rows.len) allocator.free(right);
+        try rows.append(allocator, try std.fmt.allocPrint(allocator, "{s}{s} │ {s}{s}", .{ left, ansi.reset(), right, ansi.reset() }));
+    }
+    return rows.toOwnedSlice(allocator);
 }
 
 fn renderSplitCell(
     allocator: std.mem.Allocator,
+    state: *State,
     file: diff.DiffFile,
+    file_index: usize,
     store: store_mod.Store,
     maybe_line: ?*const diff.DiffLine,
     width: usize,
@@ -496,17 +768,56 @@ fn renderSplitCell(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
+    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, maybe_line, width, line_width, selected, 1, ansi, palette);
+    defer allocator.free(rows);
+    return rows[0];
+}
+
+fn renderSplitCellRows(
+    allocator: std.mem.Allocator,
+    state: *State,
+    file: diff.DiffFile,
+    file_index: usize,
+    store: store_mod.Store,
+    maybe_line: ?*const diff.DiffLine,
+    width: usize,
+    line_width: usize,
+    selected: bool,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![][]u8 {
+    if (max_lines == 0) return allocator.alloc([]u8, 0);
     if (maybe_line) |line| {
         const label = try lineLabel(allocator, line, line_width);
         defer allocator.free(label);
-        const highlighted = try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
+        const highlighted = state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch
+            try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
         defer allocator.free(highlighted);
         const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
-        const raw = try std.fmt.allocPrint(allocator, "{s} {s}  {s}", .{ comment_mark, label, highlighted });
-        defer allocator.free(raw);
-        return styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette));
+        const prefix = try std.fmt.allocPrint(allocator, "{s} {s}  ", .{ comment_mark, label });
+        defer allocator.free(prefix);
+        const wrap_widths = lineWrapWidths(width, prefix.len, line.text);
+        const continuation_prefix = try blankLabel(allocator, wrap_widths.continuation_prefix);
+        defer allocator.free(continuation_prefix);
+        const wrapped = try wrapAnsiTextWithWidths(allocator, highlighted, wrap_widths.first, wrap_widths.continuation, max_lines);
+        defer {
+            for (wrapped) |segment| allocator.free(segment);
+            allocator.free(wrapped);
+        }
+        var rows: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (rows.items) |row_text| allocator.free(row_text);
+            rows.deinit(allocator);
+        }
+        for (wrapped, 0..) |segment, i| {
+            const raw = try std.fmt.allocPrint(allocator, "{s}{s}", .{ if (i == 0) prefix else continuation_prefix, segment });
+            defer allocator.free(raw);
+            try rows.append(allocator, try styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette)));
+        }
+        return rows.toOwnedSlice(allocator);
     }
-    return styleCell(allocator, " ", width, ansi, if (selected) palette.bg_selected else palette.bg_default, palette.fg_muted);
+    return oneRenderedLine(allocator, try styleCell(allocator, " ", width, ansi, if (selected) palette.bg_selected else palette.bg_default, palette.fg_muted));
 }
 
 fn styleCell(
@@ -631,7 +942,7 @@ fn lineNumberWidth(file: diff.DiffFile) usize {
     return @max(width, 4);
 }
 
-fn isSelected(state: State, row_index: usize) bool {
+fn isSelected(state: *const State, row_index: usize) bool {
     if (row_index == state.cursor_row) return true;
     if (state.selection_start) |start| {
         return row_index >= @min(start, state.cursor_row) and row_index <= @max(start, state.cursor_row);
@@ -643,7 +954,7 @@ fn renderFileTree(
     allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     store: store_mod.Store,
-    state: State,
+    state: *const State,
     width: usize,
     height: usize,
     ansi: theme.Ansi,
@@ -656,7 +967,7 @@ fn renderFileTree(
         lines.deinit(allocator);
     }
     try lines.append(allocator, try styleCell(allocator, " files", width, ansi, palette.bg_panel, palette.fg_muted));
-    const start = fileTreeStart(snapshot, &state, height);
+    const start = fileTreeStart(snapshot, state, height);
     const end = @min(snapshot.files.len, start + height - 1);
     for (snapshot.files[start..end], start..) |file, i| {
         const reviewed = store.isReviewed(file.path, file.patch_fingerprint, snapshot.review_target.target_id);
@@ -680,7 +991,7 @@ fn moveLine(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *S
     const total = view.rows.len;
     if (total == 0) return;
     state.cursor_row = moveIndex(state.cursor_row, total, delta);
-    ensureCursorVisible(view, state);
+    try ensureCursorVisible(allocator, snapshot, view, state);
 }
 
 fn scrollLines(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
@@ -690,7 +1001,7 @@ fn scrollLines(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     if (total == 0) return;
     state.cursor_row = moveIndex(state.cursor_row, total, delta);
     state.scroll_row = moveIndex(state.scroll_row, total, delta);
-    ensureCursorVisible(view, state);
+    try ensureCursorVisible(allocator, snapshot, view, state);
 }
 
 fn moveFile(snapshot: diff.DiffSnapshot, state: *State, delta: isize) void {
@@ -711,7 +1022,7 @@ fn moveIndex(current: usize, len: usize, delta: isize) usize {
     return @min(next, len - 1);
 }
 
-fn ensureCursorVisible(view: tui_view.FileView, state: *State) void {
+fn ensureCursorVisible(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) !void {
     const layout = Layout.init(terminalSize());
     const total = view.rows.len;
     if (total == 0) {
@@ -719,10 +1030,120 @@ fn ensureCursorVisible(view: tui_view.FileView, state: *State) void {
         return;
     }
     if (state.cursor_row < state.scroll_row) state.scroll_row = state.cursor_row;
-    if (state.cursor_row >= state.scroll_row + layout.body_height) {
-        state.scroll_row = state.cursor_row - layout.body_height + 1;
-    }
     if (state.scroll_row >= total) state.scroll_row = total - 1;
+
+    const file = snapshot.files[state.active_file];
+    while (state.scroll_row < state.cursor_row) {
+        const height = try visualHeightBetween(allocator, snapshot, state, view, state.scroll_row, state.cursor_row + 1, layout);
+        if (height <= layout.body_height) break;
+        state.scroll_row += 1;
+    }
+
+    const scroll_row_height = visualRowHeight(allocator, snapshot, state, file, view.rows[state.scroll_row], layout) catch 1;
+    if (scroll_row_height > layout.body_height and state.scroll_row < state.cursor_row) {
+        state.scroll_row = state.cursor_row;
+    }
+    try fillViewportAtBottom(allocator, snapshot, state, view, layout);
+}
+
+fn visualHeightBetween(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    state: *const State,
+    view: tui_view.FileView,
+    start: usize,
+    end: usize,
+    layout: Layout,
+) !usize {
+    const file = snapshot.files[state.active_file];
+    var height: usize = 0;
+    for (view.rows[start..end]) |row| height += try visualRowHeight(allocator, snapshot, state, file, row, layout);
+    return height;
+}
+
+fn fillViewportAtBottom(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    state: *State,
+    view: tui_view.FileView,
+    layout: Layout,
+) !void {
+    if (view.rows.len == 0 or state.scroll_row >= view.rows.len) return;
+    var height = try visualHeightBetween(allocator, snapshot, state, view, state.scroll_row, view.rows.len, layout);
+    while (state.scroll_row > 0 and height < layout.body_height) {
+        const prev = state.scroll_row - 1;
+        const file = snapshot.files[state.active_file];
+        const prev_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[prev], layout);
+        if (height + prev_height > layout.body_height) break;
+        state.scroll_row = prev;
+        height += prev_height;
+    }
+}
+
+fn rowAtVisualOffset(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    state: *const State,
+    view: tui_view.FileView,
+    offset: usize,
+    layout: Layout,
+) !usize {
+    const file = snapshot.files[state.active_file];
+    var visual_y: usize = 0;
+    var row_index = @min(state.scroll_row, view.rows.len - 1);
+    while (row_index < view.rows.len) : (row_index += 1) {
+        const row_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[row_index], layout);
+        if (offset < visual_y + row_height) return row_index;
+        visual_y += row_height;
+    }
+    return view.rows.len - 1;
+}
+
+fn visualRowHeight(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    state: *const State,
+    file: diff.DiffFile,
+    row: tui_view.VisualRow,
+    layout: Layout,
+) !usize {
+    _ = snapshot;
+    const line_width = lineNumberWidth(file);
+    return switch (row.kind) {
+        .file_header, .hunk_header, .fold => 1,
+        .stacked_code, .file_meta => if (row.line) |line|
+            try stackedLineHeight(allocator, line, layout.main_width, line_width)
+        else
+            1,
+        .split_code => try splitLineHeight(allocator, state, row, layout.main_width, line_width),
+    };
+}
+
+fn stackedLineHeight(allocator: std.mem.Allocator, line: *const diff.DiffLine, width: usize, line_width: usize) !usize {
+    const prefix_width = 2 + 1 + line_width + 2;
+    const wrap_widths = lineWrapWidths(width, prefix_width, line.text);
+    return wrapAnsiTextLineCount(allocator, line.text, wrap_widths.first, wrap_widths.continuation);
+}
+
+fn splitLineHeight(allocator: std.mem.Allocator, state: *const State, row: tui_view.VisualRow, width: usize, line_width: usize) !usize {
+    _ = state;
+    if (width < 32) {
+        if (row.right) |right| return stackedLineHeight(allocator, right, width, line_width);
+        if (row.left) |left| return stackedLineHeight(allocator, left, width, line_width);
+        return 1;
+    }
+    const separator_width: usize = 3;
+    const side_width = (width - separator_width) / 2;
+    const right_width = width - side_width - separator_width;
+    const left_height = if (row.left) |left| try splitCellHeight(allocator, left, side_width, line_width) else 1;
+    const right_height = if (row.right) |right| try splitCellHeight(allocator, right, right_width, line_width) else 1;
+    return @max(left_height, right_height);
+}
+
+fn splitCellHeight(allocator: std.mem.Allocator, line: *const diff.DiffLine, width: usize, line_width: usize) !usize {
+    const prefix_width = 1 + 1 + line_width + 2;
+    const wrap_widths = lineWrapWidths(width, prefix_width, line.text);
+    return wrapAnsiTextLineCount(allocator, line.text, wrap_widths.first, wrap_widths.continuation);
 }
 
 fn jumpUnreviewed(snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *State) void {
@@ -759,7 +1180,7 @@ fn clampCursor(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     }
     state.cursor_row = @min(state.cursor_row, view.rows.len - 1);
     state.scroll_row = @min(state.scroll_row, view.rows.len - 1);
-    ensureCursorVisible(view, state);
+    try ensureCursorVisible(allocator, snapshot, view, state);
 }
 
 fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
@@ -768,7 +1189,7 @@ fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: 
     const next = if (delta > 0) tui_view.nextChange(view, state.cursor_row) else tui_view.previousChange(view, state.cursor_row);
     if (next) |row| {
         state.cursor_row = row;
-        ensureCursorVisible(view, state);
+        try ensureCursorVisible(allocator, snapshot, view, state);
     }
 }
 
@@ -782,7 +1203,7 @@ fn toggleCurrentFold(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, 
     var updated = try currentView(allocator, snapshot, state);
     defer updated.deinit(allocator);
     if (findFoldRowById(updated, id)) |row| state.cursor_row = row else state.cursor_row = @min(target, if (updated.rows.len == 0) 0 else updated.rows.len - 1);
-    ensureCursorVisible(updated, state);
+    try ensureCursorVisible(allocator, snapshot, updated, state);
 }
 
 fn findFoldTarget(view: tui_view.FileView, cursor_row: usize) ?usize {
@@ -854,7 +1275,7 @@ fn addCommentAtCursor(
     allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     store: *store_mod.Store,
-    state: State,
+    state: *const State,
     body: []const u8,
     author: []const u8,
 ) !void {
@@ -912,7 +1333,25 @@ fn terminalSize() Size {
             return .{ .width = wsz.col, .height = wsz.row };
         }
     }
+    if (terminalSizeFromPosixIoctl()) |size| return size;
     return .{ .width = terminalEnv("COLUMNS", 100), .height = terminalEnv("LINES", 32) };
+}
+
+fn terminalSizeFromPosixIoctl() ?Size {
+    if (builtin.os.tag == .windows) return null;
+    var wsz: std.posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    const rc = std.posix.system.ioctl(
+        std.posix.STDOUT_FILENO,
+        @intCast(std.posix.T.IOCGWINSZ),
+        @intFromPtr(&wsz),
+    );
+    if (rc != 0 or wsz.col == 0 or wsz.row == 0) return null;
+    return .{ .width = wsz.col, .height = wsz.row };
 }
 
 fn terminalEnv(comptime name: []const u8, fallback: usize) usize {
@@ -971,6 +1410,72 @@ test "parse sgr mouse wheel" {
 test "layout body fills rows between status and footer" {
     const layout = Layout.init(.{ .width = 100, .height = 20 });
     try std.testing.expectEqual(@as(usize, 18), layout.body_height);
+}
+
+test "wrap ansi text ignores color escapes in visible width" {
+    const allocator = std.testing.allocator;
+    const rows = try wrapAnsiText(allocator, "\x1b[31mabcdef\x1b[0m", 3, 4);
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("\x1b[31mabc", rows[0]);
+    try std.testing.expectEqualStrings("def\x1b[0m", rows[1]);
+}
+
+test "wrap ansi text supports narrower continuation rows" {
+    const allocator = std.testing.allocator;
+    const rows = try wrapAnsiTextWithWidths(allocator, "abcdefghi", 4, 3, 4);
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("abcd", rows[0]);
+    try std.testing.expectEqualStrings("efg", rows[1]);
+    try std.testing.expectEqualStrings("hi", rows[2]);
+}
+
+test "wrap ansi text prefers word boundaries" {
+    const allocator = std.testing.allocator;
+    const rows = try wrapAnsiText(allocator, "alpha beta gamma", 12, 4);
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("alpha beta", rows[0]);
+    try std.testing.expectEqualStrings("gamma", rows[1]);
+}
+
+test "wrap ansi text can break at code delimiters" {
+    const allocator = std.testing.allocator;
+    const rows = try wrapAnsiText(allocator, "call(alpha,beta)", 11, 4);
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("call(alpha,", rows[0]);
+    try std.testing.expectEqualStrings("beta)", rows[1]);
+}
+
+test "wrap ansi text can break after assignment" {
+    const allocator = std.testing.allocator;
+    const rows = try wrapAnsiText(allocator, "const value = call()", 14, 4);
+    defer {
+        for (rows) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("const value =", rows[0]);
+    try std.testing.expectEqualStrings("call()", rows[1]);
+}
+
+test "continuation prefix follows code indentation plus one" {
+    try std.testing.expectEqual(@as(usize, 13), continuationPrefixWidth(80, 8, 4));
+    try std.testing.expectEqual(@as(usize, 20), continuationPrefixWidth(21, 8, 40));
 }
 
 test "file tree start avoids unsigned underflow at first scroll row" {
