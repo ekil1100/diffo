@@ -137,6 +137,15 @@ diffo comments get cmt_0123456789abcdef
 diffo comments get cmt_0123456789abcdef --json
 ```
 
+清理当前 review target 中已经过期的注释（锚点状态为 `stale` 或 `missing`）：
+
+```sh
+diffo comments clean
+diffo comments clean --dry-run
+diffo comments clean --file src/main.zig
+diffo comments clean --json
+```
+
 Add a comment without opening the TUI:
 
 ```sh

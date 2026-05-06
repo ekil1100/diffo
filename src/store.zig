@@ -250,6 +250,39 @@ pub const Store = struct {
         }
     }
 
+    pub fn outdatedCommentCount(self: Store, target_id: []const u8, file_filter: ?[]const u8) usize {
+        var count: usize = 0;
+        for (self.comments) |comment| {
+            if (!util.eql(comment.review_target_id, target_id)) continue;
+            if (file_filter) |file| if (!util.eql(comment.file_path, file)) continue;
+            if (isOutdated(comment.match_status)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn removeOutdatedComments(self: *Store, target_id: []const u8, file_filter: ?[]const u8) StoreError!usize {
+        const remove_count = self.outdatedCommentCount(target_id, file_filter);
+        if (remove_count == 0) return 0;
+
+        const kept_count = self.comments.len - remove_count;
+        const kept = try self.allocator.alloc(Comment, kept_count);
+        var kept_index: usize = 0;
+        for (self.comments) |*comment| {
+            const matches_target = util.eql(comment.review_target_id, target_id);
+            const matches_file = if (file_filter) |file| util.eql(comment.file_path, file) else true;
+            if (matches_target and matches_file and isOutdated(comment.match_status)) {
+                comment.deinit(self.allocator);
+            } else {
+                kept[kept_index] = comment.*;
+                kept_index += 1;
+            }
+        }
+        self.allocator.free(self.comments);
+        self.comments = kept;
+        try self.saveComments();
+        return remove_count;
+    }
+
     fn saveComments(self: *Store) StoreError!void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -430,6 +463,10 @@ fn parseMatchStatus(label: []const u8) MatchStatus {
     return .exact;
 }
 
+fn isOutdated(status: MatchStatus) bool {
+    return status == .stale or status == .missing;
+}
+
 fn jsonString(allocator: std.mem.Allocator, item: std.json.Value, key: []const u8, default: []const u8) ![]u8 {
     if (jsonStringView(item, key)) |value| return util.dupe(allocator, value);
     return util.dupe(allocator, default);
@@ -513,4 +550,67 @@ test "state invalidates by patch fingerprint" {
     try store.setReviewed("repo_test", "target_test", file, true);
     try std.testing.expect(store.isReviewed("src/main.zig", "sha256:a", "target_test"));
     try std.testing.expect(!store.isReviewed("src/main.zig", "sha256:b", "target_test"));
+}
+
+test "removing outdated comments respects target and file filter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+
+    var comments = try allocator.alloc(Comment, 4);
+    comments[0] = try testComment(allocator, "cmt_stale_a", "target_a", "src/a.zig", .stale);
+    comments[1] = try testComment(allocator, "cmt_missing_b", "target_a", "src/b.zig", .missing);
+    comments[2] = try testComment(allocator, "cmt_exact_a", "target_a", "src/a.zig", .exact);
+    comments[3] = try testComment(allocator, "cmt_other_target", "target_b", "src/a.zig", .stale);
+
+    var store = Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = comments,
+        .states = try allocator.alloc(ReviewState, 0),
+    };
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), store.outdatedCommentCount("target_a", "src/a.zig"));
+    try std.testing.expectEqual(@as(usize, 1), try store.removeOutdatedComments("target_a", "src/a.zig"));
+    try std.testing.expectEqual(@as(usize, 3), store.comments.len);
+    try std.testing.expect(!hasComment(store, "cmt_stale_a"));
+    try std.testing.expect(hasComment(store, "cmt_missing_b"));
+    try std.testing.expect(hasComment(store, "cmt_exact_a"));
+    try std.testing.expect(hasComment(store, "cmt_other_target"));
+}
+
+fn testComment(allocator: std.mem.Allocator, id: []const u8, target_id: []const u8, file_path: []const u8, status: MatchStatus) !Comment {
+    return .{
+        .comment_id = try util.dupe(allocator, id),
+        .repository_id = try util.dupe(allocator, "repo_test"),
+        .review_target_id = try util.dupe(allocator, target_id),
+        .file_path = try util.dupe(allocator, file_path),
+        .side = try util.dupe(allocator, "new"),
+        .start_line = 1,
+        .end_line = 1,
+        .stable_line_id = try util.dupe(allocator, "line_test"),
+        .hunk_header = try util.dupe(allocator, "@@ -1 +1 @@"),
+        .context_before = try util.dupe(allocator, ""),
+        .context_after = try util.dupe(allocator, ""),
+        .patch_fingerprint = try util.dupe(allocator, "sha256:old"),
+        .match_status = status,
+        .body = try util.dupe(allocator, "body"),
+        .author = try util.dupe(allocator, "tester"),
+        .created_at = try util.dupe(allocator, "2026-01-01T00:00:00Z"),
+        .updated_at = try util.dupe(allocator, "2026-01-01T00:00:00Z"),
+    };
+}
+
+fn hasComment(store: Store, id: []const u8) bool {
+    for (store.comments) |comment| {
+        if (util.eql(comment.comment_id, id)) return true;
+    }
+    return false;
 }

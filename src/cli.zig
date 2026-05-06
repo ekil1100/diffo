@@ -38,7 +38,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) C
 }
 
 fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8, debug_git: bool) CliError!void {
-    if (args.len == 0 or (!util.eql(args[0], "list") and !util.eql(args[0], "get") and !util.eql(args[0], "add"))) return error.InvalidArguments;
+    if (args.len == 0 or (!util.eql(args[0], "list") and !util.eql(args[0], "get") and !util.eql(args[0], "add") and !util.eql(args[0], "clean") and !util.eql(args[0], "cleanup"))) return error.InvalidArguments;
     if (util.eql(args[0], "list")) {
         var file_filter: ?[]const u8 = null;
         var json = false;
@@ -106,6 +106,28 @@ fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         var comment = try context.store.addComment(context.snapshot.repository.repo_id, context.snapshot.review_target.target_id, file.*, line.line, line.hunk_header, end_line, body.?, author);
         defer comment.deinit(allocator);
         try printOneCommentText(allocator, io, comment);
+        return;
+    }
+    if (util.eql(args[0], "clean") or util.eql(args[0], "cleanup")) {
+        var file_filter: ?[]const u8 = null;
+        var json = false;
+        var dry_run = false;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (util.eql(args[i], "--json")) json = true else if (util.eql(args[i], "--dry-run")) dry_run = true else if (util.eql(args[i], "--file")) {
+                i += 1;
+                if (i >= args.len) return error.InvalidArguments;
+                file_filter = args[i];
+            } else return error.InvalidArguments;
+        }
+        var context = try loadDefaultContext(allocator, io, debug_git);
+        defer context.deinit();
+        context.store.refreshMatchStatus(context.snapshot);
+        const removed_count = if (dry_run)
+            context.store.outdatedCommentCount(context.snapshot.review_target.target_id, file_filter)
+        else
+            try context.store.removeOutdatedComments(context.snapshot.review_target.target_id, file_filter);
+        if (json) try printCleanCommentsJson(allocator, io, context.snapshot, removed_count, dry_run) else try printCleanCommentsText(allocator, io, removed_count, dry_run);
         return;
     }
 }
@@ -233,6 +255,29 @@ fn printOneCommentJson(allocator: std.mem.Allocator, io: std.Io, comment: store_
     defer out.deinit(allocator);
     try appendCommentJson(allocator, &out, comment, "");
     try out.append(allocator, '\n');
+    try writeAll(io, out.items);
+}
+
+fn printCleanCommentsText(allocator: std.mem.Allocator, io: std.Io, removed_count: usize, dry_run: bool) !void {
+    const line = try std.fmt.allocPrint(allocator, "{s} {d} outdated comments\n", .{ if (dry_run) "would remove" else "removed", removed_count });
+    defer allocator.free(line);
+    try writeAll(io, line);
+}
+
+fn printCleanCommentsJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.DiffSnapshot, removed_count: usize, dry_run: bool) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\n  \"schema_version\": 1,\n  \"repository_id\": ");
+    try util.writeJsonString(&out, allocator, snapshot.repository.repo_id);
+    try out.appendSlice(allocator, ",\n  \"review_target_id\": ");
+    try util.writeJsonString(&out, allocator, snapshot.review_target.target_id);
+    try out.appendSlice(allocator, ",\n  \"removed_count\": ");
+    const count_text = try std.fmt.allocPrint(allocator, "{d}", .{removed_count});
+    defer allocator.free(count_text);
+    try out.appendSlice(allocator, count_text);
+    try out.appendSlice(allocator, ",\n  \"dry_run\": ");
+    try out.appendSlice(allocator, if (dry_run) "true" else "false");
+    try out.appendSlice(allocator, "\n}\n");
     try writeAll(io, out.items);
 }
 
@@ -368,6 +413,7 @@ const helpText =
     \\  diffo comments list [--file <path>] [--json]
     \\  diffo comments get <comment-id> [--json]
     \\  diffo comments add --file <path> --line <n> [--end <n>] --body <text>
+    \\  diffo comments clean [--file <path>] [--dry-run] [--json]
     \\  diffo review status [--file <path>] [--json]
     \\  diffo review mark --file <path> [--reviewed|--unreviewed]
     \\  diffo themes list
