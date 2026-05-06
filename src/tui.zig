@@ -139,7 +139,7 @@ pub fn run(
         try writeAll(io, screen);
 
         const event = readEvent() orelse continue;
-        if (try handleEvent(allocator, io, snapshot, store, author, &state, event, &raw)) break;
+        if (try handleEvent(allocator, io, snapshot, store, author, &state, event)) break;
     }
 }
 
@@ -151,7 +151,6 @@ fn handleEvent(
     author: []const u8,
     state: *State,
     event: Event,
-    raw: *?RawTerminal,
 ) !bool {
     switch (event) {
         .mouse => |mouse| {
@@ -225,13 +224,11 @@ fn handleEvent(
                     try store.setReviewed(snapshot.repository.repo_id, snapshot.review_target.target_id, file, reviewed);
                 },
                 'c' => {
-                    if (raw.*) |*term| term.restore();
-                    try writeAll(io, "\x1b[?25h\x1b[2K\rcomment: ");
-                    const body = try readLine(allocator);
-                    defer allocator.free(body);
-                    if (body.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state, body, author);
-                    raw.* = RawTerminal.enter() catch null;
-                    try writeAll(io, "\x1b[?25l");
+                    try writeAll(io, "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h");
+                    defer writeAll(io, "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l") catch {};
+                    const body = try readCommentBody(allocator, io);
+                    defer if (body) |text| allocator.free(text);
+                    if (body) |text| if (text.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state, text, author);
                     state.selection_start = null;
                 },
                 '[' => if (key.len >= 2 and key[1] == 'f') moveFile(snapshot.*, state, -1),
@@ -1516,19 +1513,105 @@ fn terminalEnv(comptime name: []const u8, fallback: usize) usize {
     return std.fmt.parseInt(usize, value, 10) catch fallback;
 }
 
-fn readLine(allocator: std.mem.Allocator) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+const CommentInput = struct {
+    body: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *CommentInput, allocator: std.mem.Allocator) void {
+        self.body.deinit(allocator);
+    }
+
+    fn appendByte(self: *CommentInput, allocator: std.mem.Allocator, byte: u8) !void {
+        try self.body.append(allocator, byte);
+    }
+
+    fn appendNewline(self: *CommentInput, allocator: std.mem.Allocator) !void {
+        try self.body.append(allocator, '\n');
+    }
+
+    fn backspace(self: *CommentInput) void {
+        if (self.body.items.len == 0) return;
+        var start = self.body.items.len - 1;
+        while (start > 0 and (self.body.items[start] & 0xc0) == 0x80) : (start -= 1) {}
+        self.body.items.len = start;
+    }
+
+    fn takeOwned(self: *CommentInput, allocator: std.mem.Allocator) ![]u8 {
+        const owned = try self.body.toOwnedSlice(allocator);
+        self.body = .empty;
+        return owned;
+    }
+};
+
+fn readCommentBody(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+    try drawCommentEditor(allocator, io, input.body.items);
     while (true) {
         var byte: [1]u8 = undefined;
         const n = try std.posix.read(std.posix.STDIN_FILENO, &byte);
-        if (n == 0 or byte[0] == '\n' or byte[0] == '\r') break;
-        if (byte[0] == 127 or byte[0] == 8) {
-            if (out.items.len > 0) out.items.len -= 1;
-            continue;
+        if (n == 0) return try input.takeOwned(allocator);
+        switch (byte[0]) {
+            4 => return try input.takeOwned(allocator),
+            27 => return null,
+            '\n', '\r' => try input.appendNewline(allocator),
+            127, 8 => input.backspace(),
+            '\t' => try input.appendByte(allocator, byte[0]),
+            else => {
+                if (byte[0] >= 0x20) try input.appendByte(allocator, byte[0]);
+            },
         }
-        try out.append(allocator, byte[0]);
+        try drawCommentEditor(allocator, io, input.body.items);
     }
-    return out.toOwnedSlice(allocator);
+}
+
+fn drawCommentEditor(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !void {
+    const size = terminalSize();
+    const width = @max(size.width, @as(usize, 60));
+    const height = @max(size.height, @as(usize, 8));
+    const body_rows = if (height > 3) height - 3 else 1;
+    const start = commentPreviewStart(body, body_rows);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "\x1b[H\x1b[2J");
+    try tui_text.appendCell(allocator, &out, "comment  Enter newline  Ctrl+D save  Esc cancel", width);
+    try out.append(allocator, '\n');
+
+    var rendered: usize = 0;
+    var cursor = start;
+    while (rendered < body_rows) : (rendered += 1) {
+        if (cursor < body.len) {
+            const remaining = body[cursor..];
+            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+            const prefix = if (cursor == start and start > 0) "... " else "    ";
+            const line = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, remaining[0..line_end] });
+            defer allocator.free(line);
+            try tui_text.appendCell(allocator, &out, line, width);
+            try out.append(allocator, '\n');
+            cursor += line_end;
+            if (cursor < body.len and body[cursor] == '\n') cursor += 1;
+        } else {
+            try tui_text.appendCell(allocator, &out, "    ", width);
+            try out.append(allocator, '\n');
+        }
+    }
+
+    try tui_text.appendCell(allocator, &out, "Ctrl+D saves this comment. Esc closes without adding it.", width);
+    try writeAll(io, out.items);
+}
+
+fn commentPreviewStart(body: []const u8, max_rows: usize) usize {
+    if (body.len == 0 or max_rows == 0) return 0;
+    var rows: usize = 1;
+    var i = body.len;
+    while (i > 0) {
+        i -= 1;
+        if (body[i] == '\n') {
+            if (rows == max_rows) return i + 1;
+            rows += 1;
+        }
+    }
+    return 0;
 }
 
 fn writeAll(io: std.Io, bytes: []const u8) !void {
@@ -1670,6 +1753,30 @@ test "goto action tracks gg prefix and G edge jump" {
     try std.testing.expectEqual(GotoAction.top, gotoAction("gg", false));
     try std.testing.expectEqual(GotoAction.bottom, gotoAction("G", false));
     try std.testing.expectEqual(GotoAction.none, gotoAction("j", true));
+}
+
+test "comment input backspace removes utf8 character" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+    try input.body.appendSlice(allocator, "ab架");
+    input.backspace();
+    try std.testing.expectEqualStrings("ab", input.body.items);
+}
+
+test "comment input preserves multiline body" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+    try input.body.appendSlice(allocator, "first");
+    try input.appendNewline(allocator);
+    try input.body.appendSlice(allocator, "second");
+    try std.testing.expectEqualStrings("first\nsecond", input.body.items);
+}
+
+test "comment preview starts at visible trailing line" {
+    try std.testing.expectEqual(@as(usize, 0), commentPreviewStart("one\ntwo", 2));
+    try std.testing.expectEqual(@as(usize, 4), commentPreviewStart("one\ntwo\nthree", 2));
 }
 
 test "fold target falls back to nearby fold row" {
