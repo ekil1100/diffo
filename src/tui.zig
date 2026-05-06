@@ -1177,6 +1177,17 @@ fn moveIndex(current: usize, len: usize, delta: isize) usize {
 
 fn ensureCursorVisible(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) !void {
     const layout = Layout.init(terminalSize());
+    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, true);
+}
+
+fn ensureCursorVisibleInLayout(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    view: tui_view.FileView,
+    state: *State,
+    layout: Layout,
+    fill_bottom: bool,
+) !void {
     const total = view.rows.len;
     if (total == 0) {
         state.scroll_row = 0;
@@ -1196,7 +1207,49 @@ fn ensureCursorVisible(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot
     if (scroll_row_height > layout.body_height and state.scroll_row < state.cursor_row) {
         state.scroll_row = state.cursor_row;
     }
-    try fillViewportAtBottom(allocator, snapshot, state, view, layout);
+    if (fill_bottom) try fillViewportAtBottom(allocator, snapshot, state, view, layout);
+}
+
+fn centerCursorInViewport(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) !void {
+    const layout = Layout.init(terminalSize());
+    try centerCursorInLayout(allocator, snapshot, view, state, layout);
+}
+
+fn centerCursorInLayout(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    view: tui_view.FileView,
+    state: *State,
+    layout: Layout,
+) !void {
+    if (view.rows.len == 0) {
+        state.scroll_row = 0;
+        return;
+    }
+    state.cursor_row = @min(state.cursor_row, view.rows.len - 1);
+    state.scroll_row = try centeredScrollRow(allocator, snapshot, state, view, layout);
+    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, false);
+}
+
+fn centeredScrollRow(
+    allocator: std.mem.Allocator,
+    snapshot: diff.DiffSnapshot,
+    state: *const State,
+    view: tui_view.FileView,
+    layout: Layout,
+) !usize {
+    const file = snapshot.files[state.active_file];
+    const target_offset = layout.body_height / 2;
+    var scroll_row = state.cursor_row;
+    var height_above: usize = 0;
+    while (scroll_row > 0) {
+        const prev = scroll_row - 1;
+        const prev_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[prev], layout);
+        if (height_above + prev_height > target_offset) break;
+        height_above += prev_height;
+        scroll_row = prev;
+    }
+    return scroll_row;
 }
 
 fn visualHeightBetween(
@@ -1342,7 +1395,11 @@ fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: 
     const next = if (delta > 0) tui_view.nextChange(view, state.cursor_row) else tui_view.previousChange(view, state.cursor_row);
     if (next) |row| {
         state.cursor_row = row;
-        try ensureCursorVisible(allocator, snapshot, view, state);
+        if (delta > 0) {
+            try centerCursorInViewport(allocator, snapshot, view, state);
+        } else {
+            try ensureCursorVisible(allocator, snapshot, view, state);
+        }
     }
 }
 
@@ -1753,6 +1810,66 @@ test "goto action tracks gg prefix and G edge jump" {
     try std.testing.expectEqual(GotoAction.top, gotoAction("gg", false));
     try std.testing.expectEqual(GotoAction.bottom, gotoAction("G", false));
     try std.testing.expectEqual(GotoAction.none, gotoAction("j", true));
+}
+
+test "center cursor places target row at viewport midpoint" {
+    const rows = [_]tui_view.VisualRow{.{ .kind = .file_header }} ** 30;
+    const changes = [_]tui_view.ChangeSpan{};
+    const view: tui_view.FileView = .{
+        .rows = @constCast(rows[0..]),
+        .changes = @constCast(changes[0..]),
+        .additions = 0,
+        .deletions = 0,
+    };
+    var files = [_]diff.DiffFile{.{
+        .path = @constCast("a.zig"),
+        .old_path = null,
+        .status = .modified,
+        .source = .explicit,
+        .language = null,
+        .is_binary = false,
+        .hunks = @constCast(&[_]diff.DiffHunk{}),
+        .patch_fingerprint = @constCast("fingerprint"),
+        .patch_text = @constCast(""),
+    }};
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files[0..],
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 20,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = null,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+
+    try centerCursorInLayout(std.testing.allocator, snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
+
+    try std.testing.expectEqual(@as(usize, 20), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 15), state.scroll_row);
+
+    state.cursor_row = 28;
+    state.scroll_row = 0;
+    try centerCursorInLayout(std.testing.allocator, snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
+
+    try std.testing.expectEqual(@as(usize, 28), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 23), state.scroll_row);
 }
 
 test "comment input backspace removes utf8 character" {
