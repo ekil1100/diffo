@@ -3,7 +3,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
-#include <endian.h>
 
 #include "./alloc.c"
 #include "./get_changed_ranges.c"
