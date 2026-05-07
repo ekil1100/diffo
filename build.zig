@@ -50,12 +50,36 @@ fn addSyntaxNativeSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
     module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-zig/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-javascript/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-typescript/typescript/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-typescript/tsx/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-rust/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-c/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-cpp/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-python/src"));
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
         .flags = &.{ "-std=c11", "-O2" },
     });
+    addC11Source(b, module, "vendor/tree-sitter-zig/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-javascript/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-javascript/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-typescript/typescript/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-typescript/typescript/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-typescript/tsx/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-typescript/tsx/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-rust/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-rust/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-c/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-cpp/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-cpp/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-python/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-python/src/scanner.c");
+}
+
+fn addC11Source(b: *std.Build, module: *std.Build.Module, path: []const u8) void {
     module.addCSourceFile(.{
-        .file = b.path("vendor/tree-sitter-zig/src/parser.c"),
+        .file = b.path(path),
         .flags = &.{ "-std=c11", "-O2" },
     });
 }

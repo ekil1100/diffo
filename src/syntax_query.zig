@@ -143,7 +143,10 @@ fn tokenForCapture(name: []const u8) ?syntax.SyntaxToken {
     if (std.mem.startsWith(u8, name, "type") or util.eql(name, "constructor")) return .type;
     if (std.mem.startsWith(u8, name, "function") or std.mem.startsWith(u8, name, "method")) return .function;
     if (std.mem.startsWith(u8, name, "number") or std.mem.startsWith(u8, name, "constant.numeric") or util.eql(name, "float") or util.eql(name, "integer")) return .number;
+    if (std.mem.startsWith(u8, name, "constant") or util.eql(name, "boolean") or util.eql(name, "null")) return .keyword;
     if (std.mem.startsWith(u8, name, "operator") or std.mem.startsWith(u8, name, "punctuation")) return .operator;
+    if (std.mem.startsWith(u8, name, "property") or std.mem.startsWith(u8, name, "attribute") or util.eql(name, "tag")) return .function;
+    if (std.mem.startsWith(u8, name, "escape")) return .string;
     return null;
 }
 
@@ -167,7 +170,7 @@ fn predicatePass(query: *c.TSQuery, match: c.TSQueryMatch, source: []const u8, s
     if (steps.len == 0 or steps[0].type != c.TSQueryPredicateStepTypeString) return false;
     const op = queryString(query, steps[0].value_id);
     const normalized = if (std.mem.startsWith(u8, op, "#")) op[1..] else op;
-    if (util.eql(normalized, "set!")) return true;
+    if (util.eql(normalized, "set!") or util.eql(normalized, "is?") or util.eql(normalized, "is-not?")) return true;
     if (util.eql(normalized, "eq?") or util.eql(normalized, "not-eq?")) {
         if (steps.len != 3) return false;
         const left = predicateValue(query, match, source, steps[1]) orelse return false;
@@ -228,6 +231,9 @@ fn queryString(query: *c.TSQuery, index: u32) []const u8 {
 }
 
 fn matchSupportedPattern(value: []const u8, pattern: []const u8) bool {
+    if (util.eql(pattern, "^[A-Z]")) {
+        return value.len > 0 and std.ascii.isUpper(value[0]);
+    }
     if (util.eql(pattern, "^[A-Z_][a-zA-Z0-9_]*")) {
         if (value.len == 0) return false;
         if (!(std.ascii.isUpper(value[0]) or value[0] == '_')) return false;
@@ -242,6 +248,24 @@ fn matchSupportedPattern(value: []const u8, pattern: []const u8) bool {
             if (!(std.ascii.isUpper(byte) or std.ascii.isDigit(byte) or byte == '_')) return false;
         }
         return true;
+    }
+    if (util.eql(pattern, "^[A-Z][A-Z\\d_]+$") or util.eql(pattern, "^[A-Z][A-Z\\d_]*$") or util.eql(pattern, "^[A-Z][A-Z_]*$")) {
+        if (value.len == 0 or !std.ascii.isUpper(value[0])) return false;
+        for (value[1..]) |byte| {
+            if (!(std.ascii.isUpper(byte) or std.ascii.isDigit(byte) or byte == '_')) return false;
+        }
+        return true;
+    }
+    if (util.eql(pattern, "^[a-z][^.]*$")) {
+        if (value.len == 0 or !std.ascii.isLower(value[0])) return false;
+        return std.mem.indexOfScalar(u8, value, '.') == null;
+    }
+    if (std.mem.startsWith(u8, pattern, "^(") and std.mem.endsWith(u8, pattern, ")$")) {
+        var alternatives = std.mem.splitScalar(u8, pattern[2 .. pattern.len - 2], '|');
+        while (alternatives.next()) |alternative| {
+            if (util.eql(value, alternative)) return true;
+        }
+        return false;
     }
     if (std.mem.startsWith(u8, pattern, "^")) {
         return std.mem.startsWith(u8, value, pattern[1..]);
@@ -259,6 +283,9 @@ test "supported lua-match predicates are conservative" {
     try std.testing.expect(matchSupportedPattern("MyType", "^[A-Z_][a-zA-Z0-9_]*"));
     try std.testing.expect(!matchSupportedPattern("myType", "^[A-Z_][a-zA-Z0-9_]*"));
     try std.testing.expect(matchSupportedPattern("//! doc", "^//!"));
+    try std.testing.expect(matchSupportedPattern("MyType", "^[A-Z]"));
+    try std.testing.expect(matchSupportedPattern("MAX_VALUE", "^[A-Z][A-Z\\d_]+$"));
+    try std.testing.expect(matchSupportedPattern("console", "^(arguments|module|console|window|document)$"));
 }
 
 test "zig query produces keyword spans" {
@@ -271,4 +298,67 @@ test "zig query produces keyword spans" {
     const spans = highlight.lineSpans(1);
     try std.testing.expect(spans.len > 0);
     try std.testing.expectEqual(syntax.SyntaxToken.keyword, spans[0].token);
+}
+
+test "bundled tree-sitter grammars produce highlight spans" {
+    const allocator = std.testing.allocator;
+    const grammars = @import("syntax_grammars.zig");
+    const samples = [_]struct {
+        language: []const u8,
+        source: []const u8,
+    }{
+        .{ .language = "javascript", .source = "const value = 1;\n" },
+        .{ .language = "typescript", .source = "const value: number = 1;\n" },
+        .{ .language = "tsx", .source = "const view = <div>{value}</div>;\n" },
+        .{ .language = "rust", .source = "fn main() { let value: usize = 1; }\n" },
+        .{ .language = "c", .source = "int main(void) { return 0; }\n" },
+        .{ .language = "cpp", .source = "class App { public: int run(); };\n" },
+        .{ .language = "python", .source = "def run() -> bool:\n    return True\n" },
+    };
+    for (samples) |sample| {
+        const grammar = grammars.find(sample.language) orelse return error.TestUnexpectedResult;
+        const source = try allocator.dupe(u8, sample.source);
+        var highlight = build(allocator, grammar.language(), grammar.query, source) catch |err| {
+            std.debug.print("failed to build syntax query for {s}: {s}\n", .{ sample.language, @errorName(err) });
+            return err;
+        };
+        defer highlight.deinit(allocator);
+        try std.testing.expect(highlight.lineSpans(1).len > 0);
+    }
+}
+
+test "typescript tree-sitter query highlights ordinary keywords" {
+    const allocator = std.testing.allocator;
+    const grammars = @import("syntax_grammars.zig");
+    const grammar = grammars.find("typescript") orelse return error.TestUnexpectedResult;
+    const source = try allocator.dupe(u8, "const value: number = 1;\nfunction run() { return value; }\n");
+    var highlight = try build(allocator, grammar.language(), grammar.query, source);
+    defer highlight.deinit(allocator);
+
+    try std.testing.expect(hasTokenText(
+        highlight.lineText(1).?,
+        highlight.lineSpans(1),
+        .keyword,
+        "const",
+    ));
+    try std.testing.expect(hasTokenText(
+        highlight.lineText(2).?,
+        highlight.lineSpans(2),
+        .keyword,
+        "function",
+    ));
+    try std.testing.expect(hasTokenText(
+        highlight.lineText(2).?,
+        highlight.lineSpans(2),
+        .keyword,
+        "return",
+    ));
+}
+
+fn hasTokenText(line: []const u8, spans: []const syntax.HighlightSpan, token: syntax.SyntaxToken, text: []const u8) bool {
+    for (spans) |span| {
+        if (span.token != token or span.end_byte > line.len) continue;
+        if (util.eql(line[span.start_byte..span.end_byte], text)) return true;
+    }
+    return false;
 }

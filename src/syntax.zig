@@ -40,7 +40,7 @@ pub const RegistryStatus = struct {
 pub fn registryStatus() RegistryStatus {
     return .{
         .mode = .tree_sitter,
-        .detail = "Tree-sitter syntax highlighting is available for bundled Zig grammar; unsupported languages and failures use lexical fallback.",
+        .detail = "Tree-sitter syntax highlighting is available for bundled Zig, TS, TSX, JS, Rust, C, C++, and Python grammars; unsupported languages and failures use lexical fallback.",
     };
 }
 
@@ -179,7 +179,7 @@ fn keywordsFor(language: []const u8) []const []const u8 {
     if (util.eql(language, "rust")) return &.{ "fn", "let", "mut", "pub", "impl", "trait", "struct", "enum", "match", "if", "else", "for", "while", "loop", "return", "use", "mod", "crate", "async", "await" };
     if (util.eql(language, "go")) return &.{ "func", "var", "const", "type", "struct", "interface", "return", "if", "else", "for", "range", "switch", "case", "defer", "go", "select", "package", "import" };
     if (util.eql(language, "python")) return &.{ "def", "class", "return", "if", "elif", "else", "for", "while", "try", "except", "finally", "with", "as", "import", "from", "lambda", "yield", "async", "await" };
-    if (util.eql(language, "typescript") or util.eql(language, "javascript")) return &.{ "const", "let", "var", "function", "return", "if", "else", "for", "while", "switch", "case", "class", "interface", "type", "import", "export", "async", "await", "new" };
+    if (util.eql(language, "typescript") or util.eql(language, "tsx") or util.eql(language, "javascript")) return &.{ "const", "let", "var", "function", "return", "if", "else", "for", "while", "switch", "case", "class", "interface", "type", "import", "export", "async", "await", "new" };
     if (util.eql(language, "c") or util.eql(language, "cpp")) return &.{ "int", "char", "void", "const", "static", "struct", "enum", "return", "if", "else", "for", "while", "switch", "case", "typedef", "class", "namespace" };
     return &.{};
 }
@@ -190,6 +190,13 @@ test "registry has graceful fallback" {
 
 test "language mode reports fallback for unsupported languages" {
     try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("zig"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("typescript"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("tsx"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("javascript"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("rust"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("c"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("cpp"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("python"));
     try std.testing.expectEqual(HighlightMode.lexical_fallback, modeForLanguage("markdown"));
     try std.testing.expectEqual(HighlightMode.lexical_fallback, modeForLanguage(null));
 }

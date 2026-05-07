@@ -479,11 +479,13 @@ fn detectLanguage(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     if (ext.len == 0) return null;
     const lang = if (util.eql(ext, ".zig"))
         "zig"
-    else if (util.eql(ext, ".ts") or util.eql(ext, ".tsx"))
+    else if (util.eql(ext, ".tsx"))
+        "tsx"
+    else if (util.eql(ext, ".ts") or util.eql(ext, ".mts") or util.eql(ext, ".cts"))
         "typescript"
-    else if (util.eql(ext, ".js") or util.eql(ext, ".jsx") or util.eql(ext, ".mjs"))
+    else if (util.eql(ext, ".js") or util.eql(ext, ".jsx") or util.eql(ext, ".mjs") or util.eql(ext, ".cjs"))
         "javascript"
-    else if (util.eql(ext, ".py"))
+    else if (util.eql(ext, ".py") or util.eql(ext, ".pyw"))
         "python"
     else if (util.eql(ext, ".go"))
         "go"
@@ -491,7 +493,7 @@ fn detectLanguage(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
         "rust"
     else if (util.eql(ext, ".c") or util.eql(ext, ".h"))
         "c"
-    else if (util.eql(ext, ".cpp") or util.eql(ext, ".hpp") or util.eql(ext, ".cc"))
+    else if (util.eql(ext, ".cpp") or util.eql(ext, ".hpp") or util.eql(ext, ".cc") or util.eql(ext, ".cxx") or util.eql(ext, ".hxx") or util.eql(ext, ".hh"))
         "cpp"
     else if (util.eql(ext, ".java"))
         "java"
@@ -506,6 +508,32 @@ fn detectLanguage(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     else
         return null;
     return try util.dupe(allocator, lang);
+}
+
+test "detects languages requested for highlighting" {
+    const allocator = std.testing.allocator;
+    const samples = [_]struct {
+        path: []const u8,
+        language: []const u8,
+    }{
+        .{ .path = "src/app.ts", .language = "typescript" },
+        .{ .path = "src/app.tsx", .language = "tsx" },
+        .{ .path = "src/app.mts", .language = "typescript" },
+        .{ .path = "src/app.js", .language = "javascript" },
+        .{ .path = "src/app.cjs", .language = "javascript" },
+        .{ .path = "src/lib.rs", .language = "rust" },
+        .{ .path = "src/main.c", .language = "c" },
+        .{ .path = "include/main.h", .language = "c" },
+        .{ .path = "src/main.cpp", .language = "cpp" },
+        .{ .path = "include/main.hh", .language = "cpp" },
+        .{ .path = "scripts/tool.py", .language = "python" },
+        .{ .path = "scripts/tool.pyw", .language = "python" },
+    };
+    for (samples) |sample| {
+        const language = (try detectLanguage(allocator, sample.path)) orelse return error.TestExpectedEqual;
+        defer allocator.free(language);
+        try std.testing.expect(util.eql(language, sample.language));
+    }
 }
 
 pub fn findLineByFlatIndex(file: DiffFile, index: usize) ?struct { hunk_index: usize, line_index: ?usize, line: ?*const DiffLine, header: []const u8 } {

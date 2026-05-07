@@ -1,0 +1,4 @@
+tree-sitter-rust grammar
+repo: https://github.com/tree-sitter/tree-sitter-rust
+commit: 77a3747266f4d621d0757825e6b11edcbf991ca5
+license: MIT

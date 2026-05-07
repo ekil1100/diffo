@@ -1,0 +1,5 @@
+tree-sitter-typescript grammar
+repo: https://github.com/tree-sitter/tree-sitter-typescript
+commit: 75b3874edb2dc714fb1fd77a32013d0f8699989f
+license: MIT
+local compatibility: parser.c uses current runtime field names; generated parser headers are vendored for typescript, tsx, and common scanner includes.
