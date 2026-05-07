@@ -343,7 +343,7 @@ fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot:
 }
 
 fn activeSyntaxMode(snapshot: diff.DiffSnapshot, file: diff.DiffFile) syntax.HighlightMode {
-    if (file.is_binary or snapshot.review_target.kind != .working_tree) return .lexical_fallback;
+    if (file.is_binary or snapshot.review_target.kind != .working_tree) return .disabled;
     return syntax.modeForLanguage(file.language);
 }
 
@@ -515,8 +515,7 @@ fn renderStackedCodeRows(
 ) ![][]u8 {
     const label = try lineLabel(allocator, line, line_width);
     defer allocator.free(label);
-    const highlighted = state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch
-        try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
+    const highlighted = try renderCodeText(allocator, state, file, file_index, line, ansi, palette);
     defer allocator.free(highlighted);
     const bar = switch (line.kind) {
         .add => "|",
@@ -545,6 +544,21 @@ fn renderStackedCodeRows(
         try rows.append(allocator, try styleCell(allocator, raw, width, ansi, rowBg(selected, line.kind, palette), rowFg(line.kind, palette)));
     }
     return rows.toOwnedSlice(allocator);
+}
+
+fn renderCodeText(
+    allocator: std.mem.Allocator,
+    state: *State,
+    file: diff.DiffFile,
+    file_index: usize,
+    line: *const diff.DiffLine,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![]u8 {
+    return state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch |err| switch (err) {
+        error.SyntaxUnavailable, error.SourceTooLarge => try util.dupe(allocator, line.text),
+        else => return err,
+    };
 }
 
 fn continuationPrefixWidth(row_width: usize, prefix_width: usize, code_indent_width: usize) usize {
@@ -824,8 +838,7 @@ fn renderSplitCellRows(
     if (maybe_line) |line| {
         const label = try lineLabel(allocator, line, line_width);
         defer allocator.free(label);
-        const highlighted = state.syntax_cache.highlightDiffLine(allocator, ansi, palette, file_index, file, line) catch
-            try syntax.highlightLine(allocator, ansi, palette, file.language, line.text);
+        const highlighted = try renderCodeText(allocator, state, file, file_index, line, ansi, palette);
         defer allocator.free(highlighted);
         const inline_highlighted = try applyInlineRanges(allocator, highlighted, line.text, inline_ranges, ansi, rowBg(selected, line.kind, palette), inlineBg(selected, line.kind, palette));
         defer allocator.free(inline_highlighted);
