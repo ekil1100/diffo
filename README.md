@@ -1,10 +1,18 @@
+<p align="center">
+  <img src="docs/assets/diffo.png" alt="diffo wordmark" width="300">
+</p>
+
 # diffo
 
 `diffo` is a terminal Git diff review tool for local review before commit or push. It opens the current working tree diff by default, including untracked files, supports `git diff`-style targets, tracks file-level reviewed state, stores inline comments, and exposes review data through script-friendly CLI commands.
 
 The project is implemented in Zig and targets Zig `0.16.0`.
 
-## Features
+## Why diffo?
+
+Use `diffo` when you want a fast local pass over changes before a commit, push, or pull request. It keeps the review loop in the terminal, remembers which file patches you have already checked, and stores comments outside the repository so review notes do not dirty the working tree.
+
+## Feature Tour
 
 - Review unstaged, staged, and untracked working tree changes by default.
 - Review explicit Git targets such as `HEAD~1..HEAD`, branches, ranges, `--cached`, and pathspecs.
@@ -19,7 +27,9 @@ The project is implemented in Zig and targets Zig `0.16.0`.
 - Validate Base16/Base24 theme files.
 - Apply syntax highlighting when terminal color support is available. Bundled Tree-sitter grammars are used for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, and Python files.
 
-## Requirements
+## Install
+
+Requirements:
 
 - Zig `0.16.0`
 - Git
@@ -38,7 +48,7 @@ brew upgrade zig
 zig version
 ```
 
-## Build
+Build from source:
 
 ```sh
 zig build
@@ -49,6 +59,22 @@ The executable is written to:
 ```sh
 zig-out/bin/diffo
 ```
+
+Install to `~/.local/bin` with `just`:
+
+```sh
+just install
+```
+
+Or install manually after building:
+
+```sh
+mkdir -p ~/.local/bin
+cp zig-out/bin/diffo ~/.local/bin/diffo
+chmod +x ~/.local/bin/diffo
+```
+
+Make sure `~/.local/bin` is on your `PATH` before running `diffo` from any repository.
 
 Run tests:
 
