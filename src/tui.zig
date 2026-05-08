@@ -79,6 +79,13 @@ const Event = union(enum) {
     mouse: MouseEvent,
 };
 
+const enter_tui_screen = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const leave_tui_screen = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+const suspend_tui_input = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h";
+const resume_tui_input = "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l";
+const enable_extended_keyboard = "\x1b[>1u\x1b[>4;2m";
+const disable_extended_keyboard = "\x1b[<u\x1b[>4;0m";
+
 const MouseEvent = struct {
     button: u16,
     x: usize,
@@ -130,8 +137,15 @@ pub fn run(
     var raw = RawTerminal.enter() catch null;
     defer if (raw) |*term| term.restore();
 
-    try writeAll(io, "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h");
-    defer writeAll(io, "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l") catch {};
+    var signals = SignalCleanup.install();
+    defer signals.restore();
+
+    try writeAll(io, enter_tui_screen);
+    SignalCleanup.active = true;
+    defer {
+        writeAll(io, leave_tui_screen) catch {};
+        SignalCleanup.active = false;
+    }
 
     while (true) {
         const screen = try render(allocator, snapshot.*, store.*, &state, true);
@@ -160,6 +174,7 @@ fn handleEvent(
         },
         .key => |key| {
             if (key.len == 0) return false;
+            if (key[0] == 3) return true;
             if (key[0] == 'q') return true;
             if (state.help and key[0] != '?') {
                 state.help = false;
@@ -224,9 +239,16 @@ fn handleEvent(
                     try store.setReviewed(snapshot.repository.repo_id, snapshot.review_target.target_id, file, reviewed);
                 },
                 'c' => {
-                    try writeAll(io, "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h");
-                    defer writeAll(io, "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l") catch {};
-                    const body = try readCommentBody(allocator, io);
+                    try writeAll(io, suspend_tui_input);
+                    var resume_after_comment = true;
+                    defer if (resume_after_comment) writeAll(io, resume_tui_input) catch {};
+                    const body = readCommentBody(allocator, io, theme.Ansi.init(true), theme.catppuccinMocha()) catch |err| switch (err) {
+                        error.Interrupted => {
+                            resume_after_comment = false;
+                            return true;
+                        },
+                        else => return err,
+                    };
                     defer if (body) |text| allocator.free(text);
                     if (body) |text| if (text.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state, text, author);
                     state.selection_start = null;
@@ -1585,89 +1607,442 @@ fn terminalEnv(comptime name: []const u8, fallback: usize) usize {
 
 const CommentInput = struct {
     body: std.ArrayList(u8) = .empty,
+    cursor: usize = 0,
 
     fn deinit(self: *CommentInput, allocator: std.mem.Allocator) void {
         self.body.deinit(allocator);
     }
 
     fn appendByte(self: *CommentInput, allocator: std.mem.Allocator, byte: u8) !void {
-        try self.body.append(allocator, byte);
+        try self.appendSlice(allocator, &.{byte});
+    }
+
+    fn appendSlice(self: *CommentInput, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        try self.body.insertSlice(allocator, self.cursor, bytes);
+        self.cursor += bytes.len;
     }
 
     fn appendNewline(self: *CommentInput, allocator: std.mem.Allocator) !void {
-        try self.body.append(allocator, '\n');
+        try self.appendByte(allocator, '\n');
     }
 
     fn backspace(self: *CommentInput) void {
-        if (self.body.items.len == 0) return;
-        var start = self.body.items.len - 1;
-        while (start > 0 and (self.body.items[start] & 0xc0) == 0x80) : (start -= 1) {}
-        self.body.items.len = start;
+        if (self.cursor == 0) return;
+        const start = previousUtf8Boundary(self.body.items, self.cursor);
+        self.removeRange(start, self.cursor);
+        self.cursor = start;
+    }
+
+    fn deleteForward(self: *CommentInput) void {
+        if (self.cursor >= self.body.items.len) return;
+        self.removeRange(self.cursor, nextUtf8Boundary(self.body.items, self.cursor));
+    }
+
+    fn moveLeft(self: *CommentInput) void {
+        self.cursor = previousUtf8Boundary(self.body.items, self.cursor);
+    }
+
+    fn moveRight(self: *CommentInput) void {
+        self.cursor = nextUtf8Boundary(self.body.items, self.cursor);
+    }
+
+    fn moveUp(self: *CommentInput) void {
+        self.cursor = verticalCursorMove(self.body.items, self.cursor, .up);
+    }
+
+    fn moveDown(self: *CommentInput) void {
+        self.cursor = verticalCursorMove(self.body.items, self.cursor, .down);
     }
 
     fn takeOwned(self: *CommentInput, allocator: std.mem.Allocator) ![]u8 {
         const owned = try self.body.toOwnedSlice(allocator);
         self.body = .empty;
+        self.cursor = 0;
         return owned;
+    }
+
+    fn removeRange(self: *CommentInput, start: usize, end: usize) void {
+        if (start >= end or end > self.body.items.len) return;
+        const len = end - start;
+        std.mem.copyForwards(u8, self.body.items[start .. self.body.items.len - len], self.body.items[end..]);
+        self.body.items.len -= len;
     }
 };
 
-fn readCommentBody(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
-    var input = CommentInput{};
-    defer input.deinit(allocator);
-    try drawCommentEditor(allocator, io, input.body.items);
-    while (true) {
-        var byte: [1]u8 = undefined;
-        const n = try std.posix.read(std.posix.STDIN_FILENO, &byte);
-        if (n == 0) return try input.takeOwned(allocator);
-        switch (byte[0]) {
-            4 => return try input.takeOwned(allocator),
-            27 => return null,
-            '\n', '\r' => try input.appendNewline(allocator),
+const CommentInputAction = enum {
+    continue_input,
+    save,
+    cancel,
+    quit,
+};
+
+fn handleCommentInputBytes(allocator: std.mem.Allocator, input: *CommentInput, bytes: []const u8) !CommentInputAction {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        switch (bytes[i]) {
+            3 => return .quit,
+            4 => {},
+            27 => {
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[13;5u") or
+                    std.mem.startsWith(u8, bytes[i..], "\x1b[10;5u"))
+                {
+                    return .save;
+                }
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[27;5;13~")) return .save;
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[27;5;10~")) return .save;
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[D")) {
+                    input.moveLeft();
+                    i += 3;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[C")) {
+                    input.moveRight();
+                    i += 3;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[A")) {
+                    input.moveUp();
+                    i += 3;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[B")) {
+                    input.moveDown();
+                    i += 3;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, bytes[i..], "\x1b[3~")) {
+                    input.deleteForward();
+                    i += 4;
+                    continue;
+                }
+                return .cancel;
+            },
+            '\r' => {
+                try input.appendNewline(allocator);
+                i += 1;
+                if (i < bytes.len and bytes[i] == '\n') i += 1;
+                continue;
+            },
+            '\n' => {
+                try input.appendNewline(allocator);
+                i += 1;
+                continue;
+            },
             127, 8 => input.backspace(),
-            '\t' => try input.appendByte(allocator, byte[0]),
+            '\t' => try input.appendByte(allocator, bytes[i]),
             else => {
-                if (byte[0] >= 0x20) try input.appendByte(allocator, byte[0]);
+                if (bytes[i] >= 0x20) {
+                    const seq_len = tui_text.utf8SeqLen(bytes[i]);
+                    if (i + seq_len <= bytes.len) {
+                        try input.appendSlice(allocator, bytes[i .. i + seq_len]);
+                        i += seq_len;
+                        continue;
+                    }
+                    try input.appendByte(allocator, bytes[i]);
+                }
             },
         }
-        try drawCommentEditor(allocator, io, input.body.items);
+        i += 1;
+    }
+    return .continue_input;
+}
+
+fn readCommentBody(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) !?[]u8 {
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+    try writeAll(io, enable_extended_keyboard);
+    defer writeAll(io, disable_extended_keyboard) catch {};
+    try drawCommentEditor(allocator, io, input, ansi, palette);
+    while (true) {
+        var bytes: [64]u8 = undefined;
+        const n = try std.posix.read(std.posix.STDIN_FILENO, &bytes);
+        if (n == 0) return try input.takeOwned(allocator);
+        switch (try handleCommentInputBytes(allocator, &input, bytes[0..n])) {
+            .continue_input => {},
+            .save => return try input.takeOwned(allocator),
+            .cancel => return null,
+            .quit => return error.Interrupted,
+        }
+        try drawCommentEditor(allocator, io, input, ansi, palette);
     }
 }
 
-fn drawCommentEditor(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !void {
-    const size = terminalSize();
-    const width = @max(size.width, @as(usize, 60));
-    const height = @max(size.height, @as(usize, 8));
-    const body_rows = if (height > 3) height - 3 else 1;
-    const start = commentPreviewStart(body, body_rows);
+fn drawCommentEditor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: CommentInput,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) !void {
+    const layout = CommentEditorLayout.init(terminalSize());
+    const body = input.body.items;
+    const start = commentPreviewStartForCursor(body, input.cursor, layout.body_rows);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    try out.appendSlice(allocator, "\x1b[H\x1b[2J");
-    try tui_text.appendCell(allocator, &out, "comment  Enter newline  Ctrl+D save  Esc cancel", width);
-    try out.append(allocator, '\n');
+    try appendEditorBackdrop(allocator, &out, layout, ansi, palette);
+    try appendStyledEditorLine(allocator, &out, layout.y, layout.x, try editorBorder(allocator, layout.width), layout.width, ansi, palette, false);
 
     var rendered: usize = 0;
     var cursor = start;
-    while (rendered < body_rows) : (rendered += 1) {
+    while (rendered < layout.body_rows) : (rendered += 1) {
         if (cursor < body.len) {
             const remaining = body[cursor..];
             const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-            const prefix = if (cursor == start and start > 0) "... " else "    ";
-            const line = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, remaining[0..line_end] });
-            defer allocator.free(line);
-            try tui_text.appendCell(allocator, &out, line, width);
-            try out.append(allocator, '\n');
+            try appendEditorLine(allocator, &out, layout, layout.body_y + rendered, remaining[0..line_end], ansi, palette, false);
             cursor += line_end;
             if (cursor < body.len and body[cursor] == '\n') cursor += 1;
         } else {
-            try tui_text.appendCell(allocator, &out, "    ", width);
-            try out.append(allocator, '\n');
+            try appendEditorLine(allocator, &out, layout, layout.body_y + rendered, "", ansi, palette, false);
         }
     }
 
-    try tui_text.appendCell(allocator, &out, "Ctrl+D saves this comment. Esc closes without adding it.", width);
+    var spacer = layout.body_y + rendered;
+    while (spacer < layout.height - 2) : (spacer += 1) {
+        try appendEditorLine(allocator, &out, layout, spacer, "", ansi, palette, false);
+    }
+
+    try appendEditorLine(allocator, &out, layout, layout.height - 2, "Enter newline  Ctrl+Enter save  Esc cancel", ansi, palette, true);
+    try appendStyledEditorLine(allocator, &out, layout.y + layout.height - 1, layout.x, try editorBorder(allocator, layout.width), layout.width, ansi, palette, false);
+
+    const cursor_pos = commentCursorPosition(body, input.cursor, start, layout);
+    try appendCursorMove(allocator, &out, cursor_pos.y, cursor_pos.x);
     try writeAll(io, out.items);
+}
+
+const CommentEditorLayout = struct {
+    panel_x: usize,
+    panel_y: usize,
+    panel_width: usize,
+    panel_height: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    content_x: usize,
+    content_width: usize,
+    body_y: usize,
+    body_rows: usize,
+
+    fn init(size: Size) CommentEditorLayout {
+        const terminal_width = @max(size.width, @as(usize, 60));
+        const terminal_height = @max(size.height, @as(usize, 8));
+        const width = @min(@as(usize, 84), terminal_width - 4);
+        const height = @min(@as(usize, 14), terminal_height - 2);
+        const x = ((terminal_width - width) / 2) + 1;
+        const y = ((terminal_height - height) / 2) + 1;
+        const panel_pad_x = @min(@as(usize, 8), x - 1);
+        const panel_pad_top = @min(@as(usize, 1), y - 1);
+        const panel_x = x - panel_pad_x;
+        const panel_y = y - panel_pad_top;
+        const panel_width = @min((terminal_width -| panel_x) +| 1, width +| panel_pad_x +| panel_pad_x);
+        const panel_height = @min((terminal_height -| panel_y) +| 1, height +| panel_pad_top +| 1);
+        return .{
+            .panel_x = panel_x,
+            .panel_y = panel_y,
+            .panel_width = panel_width,
+            .panel_height = panel_height,
+            .x = x,
+            .y = y,
+            .width = width,
+            .height = height,
+            .content_x = 3,
+            .content_width = width - 5,
+            .body_y = 2,
+            .body_rows = height - 4,
+        };
+    }
+};
+
+const CommentCursorPosition = struct {
+    x: usize,
+    y: usize,
+};
+
+const VerticalDirection = enum {
+    up,
+    down,
+};
+
+fn previousUtf8Boundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor == 0) return 0;
+    var i = @min(cursor, bytes.len) - 1;
+    while (i > 0 and (bytes[i] & 0xc0) == 0x80) : (i -= 1) {}
+    return i;
+}
+
+fn nextUtf8Boundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor >= bytes.len) return bytes.len;
+    const seq_len = tui_text.utf8SeqLen(bytes[cursor]);
+    return @min(bytes.len, cursor + seq_len);
+}
+
+fn lineStartBefore(bytes: []const u8, cursor: usize) usize {
+    var i = @min(cursor, bytes.len);
+    while (i > 0) {
+        if (bytes[i - 1] == '\n') return i;
+        i -= 1;
+    }
+    return 0;
+}
+
+fn lineEndAfter(bytes: []const u8, cursor: usize) usize {
+    var i = @min(cursor, bytes.len);
+    while (i < bytes.len and bytes[i] != '\n') : (i += 1) {}
+    return i;
+}
+
+fn displayWidthRange(bytes: []const u8, start: usize, end: usize) usize {
+    var width: usize = 0;
+    var i = start;
+    while (i < end) {
+        const seq_len = tui_text.utf8SeqLen(bytes[i]);
+        if (i + seq_len > end) break;
+        width += tui_text.displayWidth(bytes[i .. i + seq_len]);
+        i += seq_len;
+    }
+    return width;
+}
+
+fn cursorForColumn(bytes: []const u8, line_start: usize, line_end: usize, target_column: usize) usize {
+    var width: usize = 0;
+    var i = line_start;
+    while (i < line_end) {
+        const seq_len = tui_text.utf8SeqLen(bytes[i]);
+        if (i + seq_len > line_end) break;
+        const next_width = width + tui_text.displayWidth(bytes[i .. i + seq_len]);
+        if (next_width > target_column) break;
+        width = next_width;
+        i += seq_len;
+    }
+    return i;
+}
+
+fn verticalCursorMove(bytes: []const u8, cursor: usize, direction: VerticalDirection) usize {
+    const current_line_start = lineStartBefore(bytes, cursor);
+    const current_line_end = lineEndAfter(bytes, cursor);
+    const target_column = displayWidthRange(bytes, current_line_start, cursor);
+
+    switch (direction) {
+        .up => {
+            if (current_line_start == 0) return cursor;
+            const previous_line_end = current_line_start - 1;
+            const previous_line_start = lineStartBefore(bytes, previous_line_end);
+            return cursorForColumn(bytes, previous_line_start, previous_line_end, target_column);
+        },
+        .down => {
+            if (current_line_end >= bytes.len) return cursor;
+            const next_line_start = current_line_end + 1;
+            const next_line_end = lineEndAfter(bytes, next_line_start);
+            return cursorForColumn(bytes, next_line_start, next_line_end, target_column);
+        },
+    }
+}
+
+fn commentCursorPosition(body: []const u8, cursor: usize, start: usize, layout: CommentEditorLayout) CommentCursorPosition {
+    var row: usize = 0;
+    var line_start = start;
+    var i = start;
+    while (i < cursor and i < body.len) : (i += 1) {
+        if (body[i] == '\n') {
+            if (row + 1 < layout.body_rows) {
+                row += 1;
+                line_start = i + 1;
+            }
+        }
+    }
+
+    const visible_width = displayWidthRange(body, line_start, @min(cursor, body.len));
+
+    return .{
+        .x = layout.x + layout.content_x + @min(layout.content_width, visible_width),
+        .y = layout.y + layout.body_y + @min(row, layout.body_rows - 1),
+    };
+}
+
+fn appendCursorMove(allocator: std.mem.Allocator, out: *std.ArrayList(u8), y: usize, x: usize) !void {
+    const cursor_move = try std.fmt.allocPrint(allocator, "\x1b[{d};{d}H", .{ y, x });
+    defer allocator.free(cursor_move);
+    try out.appendSlice(allocator, cursor_move);
+}
+
+fn appendBoxBorder(allocator: std.mem.Allocator, out: *std.ArrayList(u8), width: usize) !void {
+    try out.append(allocator, '+');
+    var i: usize = 2;
+    while (i < width) : (i += 1) try out.append(allocator, '-');
+    try out.append(allocator, '+');
+}
+
+fn editorBlankLine(allocator: std.mem.Allocator, width: usize) ![]u8 {
+    const line = try allocator.alloc(u8, width);
+    @memset(line, ' ');
+    return line;
+}
+
+fn editorBorder(allocator: std.mem.Allocator, width: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendBoxBorder(allocator, &out, width);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendEditorBackdrop(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    layout: CommentEditorLayout,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) !void {
+    var row: usize = 0;
+    while (row < layout.panel_height) : (row += 1) {
+        try appendStyledEditorLine(allocator, out, layout.panel_y + row, layout.panel_x, try editorBlankLine(allocator, layout.panel_width), layout.panel_width, ansi, palette, false);
+    }
+}
+
+fn appendStyledEditorLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    y: usize,
+    x: usize,
+    text: []u8,
+    width: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+    muted: bool,
+) !void {
+    defer allocator.free(text);
+    try appendCursorMove(allocator, out, y, x);
+    const styled = try styleCell(allocator, text, width, ansi, palette.bg_panel, if (muted) palette.fg_muted else palette.fg_default);
+    defer allocator.free(styled);
+    try out.appendSlice(allocator, styled);
+}
+
+fn appendEditorLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    layout: CommentEditorLayout,
+    row_offset: usize,
+    text: []const u8,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+    muted: bool,
+) !void {
+    var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(allocator);
+    try raw.append(allocator, '|');
+    var pad: usize = 1;
+    while (pad < layout.content_x) : (pad += 1) try raw.append(allocator, ' ');
+    try tui_text.appendCell(allocator, &raw, text, layout.content_width);
+    const used_width = layout.content_x + layout.content_width;
+    pad = used_width;
+    while (pad < layout.width - 1) : (pad += 1) try raw.append(allocator, ' ');
+    try raw.append(allocator, '|');
+    try appendStyledEditorLine(allocator, out, layout.y + row_offset, layout.x, try raw.toOwnedSlice(allocator), layout.width, ansi, palette, muted);
 }
 
 fn commentPreviewStart(body: []const u8, max_rows: usize) usize {
@@ -1684,9 +2059,65 @@ fn commentPreviewStart(body: []const u8, max_rows: usize) usize {
     return 0;
 }
 
+fn commentPreviewStartForCursor(body: []const u8, cursor: usize, max_rows: usize) usize {
+    if (body.len == 0 or max_rows == 0) return 0;
+    var rows: usize = 1;
+    var i = @min(cursor, body.len);
+    while (i > 0) {
+        i -= 1;
+        if (body[i] == '\n') {
+            if (rows == max_rows) return i + 1;
+            rows += 1;
+        }
+    }
+    return 0;
+}
+
 fn writeAll(io: std.Io, bytes: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io, bytes);
 }
+
+const SignalCleanup = struct {
+    previous_int: ?std.posix.Sigaction = null,
+    previous_term: ?std.posix.Sigaction = null,
+
+    var active: bool = false;
+
+    fn install() SignalCleanup {
+        if (builtin.os.tag != .linux) return .{};
+        var cleanup = SignalCleanup{};
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = handleSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var previous_int: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.INT, &action, &previous_int);
+        cleanup.previous_int = previous_int;
+        var previous_term: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TERM, &action, &previous_term);
+        cleanup.previous_term = previous_term;
+        return cleanup;
+    }
+
+    fn restore(self: *SignalCleanup) void {
+        if (self.previous_int) |previous| std.posix.sigaction(.INT, &previous, null);
+        if (self.previous_term) |previous| std.posix.sigaction(.TERM, &previous, null);
+    }
+
+    fn handleSignal(signal: std.posix.SIG) callconv(.c) void {
+        if (active) {
+            _ = std.os.linux.write(std.posix.STDOUT_FILENO, disable_extended_keyboard.ptr, disable_extended_keyboard.len);
+            _ = std.os.linux.write(std.posix.STDOUT_FILENO, leave_tui_screen.ptr, leave_tui_screen.len);
+        }
+        const status: i32 = switch (signal) {
+            .INT => 130,
+            .TERM => 143,
+            else => 128,
+        };
+        std.os.linux.exit(status);
+    }
+};
 
 const RawTerminal = struct {
     original: std.posix.termios,
@@ -1697,7 +2128,7 @@ const RawTerminal = struct {
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
         raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = true;
+        raw.lflag.ISIG = false;
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
@@ -1889,19 +2320,203 @@ test "comment input backspace removes utf8 character" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
-    try input.body.appendSlice(allocator, "ab架");
+    try input.appendSlice(allocator, "ab架");
     input.backspace();
     try std.testing.expectEqualStrings("ab", input.body.items);
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
 }
 
 test "comment input preserves multiline body" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
-    try input.body.appendSlice(allocator, "first");
+    try input.appendSlice(allocator, "first");
     try input.appendNewline(allocator);
-    try input.body.appendSlice(allocator, "second");
+    try input.appendSlice(allocator, "second");
     try std.testing.expectEqualStrings("first\nsecond", input.body.items);
+}
+
+test "comment input normalizes crlf and handles buffered backspace" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "first\r\nsecond"));
+    try std.testing.expectEqualStrings("first\nsecond", input.body.items);
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x7f!"));
+    try std.testing.expectEqualStrings("first\nsecon!", input.body.items);
+}
+
+test "comment input treats delete escape as a delete byte" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try input.appendSlice(allocator, "abc");
+    input.moveLeft();
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[3~"));
+    try std.testing.expectEqualStrings("ab", input.body.items);
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+}
+
+test "comment input saves with ctrl-enter and cancels with escape" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, "body\x1b[13;5uignored"));
+    try std.testing.expectEqualStrings("body", input.body.items);
+    try std.testing.expectEqual(.cancel, try handleCommentInputBytes(allocator, &input, "\x1b"));
+}
+
+test "comment input accepts common ctrl-enter encodings" {
+    const allocator = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\x1b[13;5u",
+        "\x1b[10;5u",
+        "\x1b[27;5;13~",
+        "\x1b[27;5;10~",
+    };
+
+    for (sequences) |sequence| {
+        var input = CommentInput{};
+        defer input.deinit(allocator);
+        try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, sequence));
+    }
+}
+
+test "comment input ignores ctrl-d as an editing byte" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try input.appendSlice(allocator, "body");
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x04"));
+    try std.testing.expectEqualStrings("body", input.body.items);
+}
+
+test "comment input treats ctrl-c as quit" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try input.appendSlice(allocator, "body");
+    try std.testing.expectEqual(.quit, try handleCommentInputBytes(allocator, &input, "\x03"));
+    try std.testing.expectEqualStrings("body", input.body.items);
+}
+
+test "comment input arrows move cursor and insert at cursor" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "abcd"));
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[D\x1b[D"));
+    try input.appendByte(allocator, 'X');
+    try std.testing.expectEqualStrings("abXcd", input.body.items);
+    try std.testing.expectEqual(@as(usize, 3), input.cursor);
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[C"));
+    input.backspace();
+    try std.testing.expectEqualStrings("abXd", input.body.items);
+}
+
+test "comment input vertical arrows preserve display column" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try input.appendSlice(allocator, "abc\n架de\nxy");
+    input.cursor = 7;
+    input.moveUp();
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+    input.moveDown();
+    try std.testing.expectEqual(@as(usize, 7), input.cursor);
+    input.moveDown();
+    try std.testing.expectEqual(@as(usize, 12), input.cursor);
+}
+
+test "comment editor layout floats within terminal" {
+    const layout = CommentEditorLayout.init(.{ .width = 120, .height = 40 });
+    try std.testing.expectEqual(@as(usize, 11), layout.panel_x);
+    try std.testing.expectEqual(@as(usize, 13), layout.panel_y);
+    try std.testing.expectEqual(@as(usize, 100), layout.panel_width);
+    try std.testing.expectEqual(@as(usize, 15), layout.panel_height);
+    try std.testing.expectEqual(@as(usize, 19), layout.x);
+    try std.testing.expectEqual(@as(usize, 14), layout.y);
+    try std.testing.expectEqual(@as(usize, 84), layout.width);
+    try std.testing.expectEqual(@as(usize, 14), layout.height);
+    try std.testing.expectEqual(@as(usize, 3), layout.content_x);
+    try std.testing.expectEqual(@as(usize, 79), layout.content_width);
+    try std.testing.expectEqual(@as(usize, 2), layout.body_y);
+    try std.testing.expectEqual(@as(usize, 10), layout.body_rows);
+}
+
+test "comment cursor follows visible body tail" {
+    const layout: CommentEditorLayout = .{
+        .panel_x = 8,
+        .panel_y = 3,
+        .panel_width = 44,
+        .panel_height = 10,
+        .x = 10,
+        .y = 4,
+        .width = 40,
+        .height = 8,
+        .content_x = 3,
+        .content_width = 35,
+        .body_y = 2,
+        .body_rows = 4,
+    };
+
+    var pos = commentCursorPosition("", 0, 0, layout);
+    try std.testing.expectEqual(@as(usize, 13), pos.x);
+    try std.testing.expectEqual(@as(usize, 6), pos.y);
+
+    pos = commentCursorPosition("one\n架", "one\n架".len, 0, layout);
+    try std.testing.expectEqual(@as(usize, 15), pos.x);
+    try std.testing.expectEqual(@as(usize, 7), pos.y);
+
+    const body = "one\ntwo\nthree";
+    const start = commentPreviewStartForCursor(body, body.len, 2);
+    pos = commentCursorPosition(body, body.len, start, .{
+        .panel_x = layout.panel_x,
+        .panel_y = layout.panel_y,
+        .panel_width = layout.panel_width,
+        .panel_height = layout.panel_height,
+        .x = layout.x,
+        .y = layout.y,
+        .width = layout.width,
+        .height = 6,
+        .content_x = layout.content_x,
+        .content_width = layout.content_width,
+        .body_y = layout.body_y,
+        .body_rows = 2,
+    });
+    try std.testing.expectEqual(@as(usize, 18), pos.x);
+    try std.testing.expectEqual(@as(usize, 7), pos.y);
+}
+
+test "comment editor line keeps declared cell width with cjk text" {
+    const allocator = std.testing.allocator;
+    const layout: CommentEditorLayout = .{
+        .panel_x = 1,
+        .panel_y = 1,
+        .panel_width = 10,
+        .panel_height = 4,
+        .x = 1,
+        .y = 1,
+        .width = 10,
+        .height = 4,
+        .content_x = 3,
+        .content_width = 5,
+        .body_y = 1,
+        .body_rows = 1,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try appendEditorLine(allocator, &out, layout, 1, "架ab", .{ .enabled = false, .true_color = false }, theme.catppuccinMocha(), false);
+    const line_start = (std.mem.indexOfScalar(u8, out.items, 'H') orelse return error.TestExpectedEqual) + 1;
+    try std.testing.expectEqual(@as(usize, 10), displayWidthRange(out.items, line_start, out.items.len));
 }
 
 test "comment preview starts at visible trailing line" {
