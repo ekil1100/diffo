@@ -18,6 +18,7 @@ const State = struct {
     scroll_row: usize = 0,
     mode: DiffMode = .stacked,
     selection_start: ?usize = null,
+    copy_notice: CopyNotice = .none,
     help: bool = false,
     pending_g: bool = false,
     folds: std.ArrayList(tui_view.FoldEntry) = .empty,
@@ -33,6 +34,12 @@ const State = struct {
         self.folds.deinit(allocator);
         self.syntax_cache.deinit();
     }
+};
+
+const CopyNotice = union(enum) {
+    none,
+    copied: usize,
+    empty,
 };
 
 const Size = struct {
@@ -103,6 +110,10 @@ const MouseEvent = struct {
     fn isLeftPress(self: MouseEvent) bool {
         return self.button == 0 and self.pressed;
     }
+
+    fn isLeftDrag(self: MouseEvent) bool {
+        return self.pressed and (self.button & 32) != 0 and (self.button & 3) == 0;
+    }
 };
 
 pub fn run(
@@ -169,6 +180,7 @@ fn handleEvent(
     switch (event) {
         .mouse => |mouse| {
             state.pending_g = false;
+            state.copy_notice = .none;
             try handleMouse(allocator, snapshot.*, state, mouse);
             return false;
         },
@@ -176,11 +188,17 @@ fn handleEvent(
             if (key.len == 0) return false;
             if (key[0] == 3) return true;
             if (key[0] == 'q') return true;
+            if (isPlainEscape(key)) {
+                cancelSelectionMode(state);
+                return false;
+            }
             if (state.help and key[0] != '?') {
                 state.help = false;
                 state.pending_g = false;
+                state.copy_notice = .none;
                 return false;
             }
+            if (key[0] != 'y') state.copy_notice = .none;
 
             switch (gotoAction(key, state.pending_g)) {
                 .none => state.pending_g = false,
@@ -232,6 +250,10 @@ fn handleEvent(
                 },
                 '?' => state.help = !state.help,
                 'V' => state.selection_start = state.cursor_row,
+                'y' => {
+                    const copied = try copySelectionToClipboard(allocator, io, snapshot.*, state);
+                    state.copy_notice = if (copied == 0) .empty else .{ .copied = copied };
+                },
                 'u' => jumpUnreviewed(snapshot.*, store.*, state),
                 'r' => {
                     const file = snapshot.files[state.active_file];
@@ -273,10 +295,12 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
         if (in_sidebar) moveFile(snapshot, state, 3) else try scrollLines(allocator, snapshot, state, 3);
         return;
     }
-    if (!mouse.isLeftPress()) return;
+    const left_drag = mouse.isLeftDrag();
+    if (!mouse.isLeftPress() and !left_drag) return;
     if (mouse.y < layout.body_y or mouse.y >= layout.footer_y) return;
 
     if (in_sidebar) {
+        if (left_drag) return;
         if (mouse.y == layout.body_y) return;
         const start = fileTreeStart(snapshot, state, layout.body_height);
         const idx = start + mouse.y - layout.body_y - 1;
@@ -291,7 +315,13 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
         defer view.deinit(allocator);
         const total = view.rows.len;
         if (total == 0) return;
-        state.cursor_row = try rowAtVisualOffset(allocator, snapshot, state, view, mouse.y - layout.body_y, layout);
+        const target = try rowAtVisualOffset(allocator, snapshot, state, view, mouse.y - layout.body_y, layout);
+        if (left_drag) {
+            if (state.selection_start == null) state.selection_start = state.cursor_row;
+        } else {
+            state.selection_start = null;
+        }
+        state.cursor_row = target;
         try ensureCursorVisible(allocator, snapshot, view, state);
     }
 }
@@ -341,11 +371,15 @@ fn render(
     }
 
     if (state.help) {
-        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  u unreviewed  ? help  q quit", layout.width);
+        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
     } else {
         const active_file = snapshot.files[state.active_file];
         const syntax_mode = activeSyntaxMode(snapshot, active_file);
-        const footer = try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  G/gg bottom/top  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) });
+        const footer = switch (state.copy_notice) {
+            .none => try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  V select  y copy  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+        };
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
     }
@@ -1103,6 +1137,148 @@ fn isSelected(state: *const State, row_index: usize) bool {
     return false;
 }
 
+const SelectedText = struct {
+    bytes: []u8,
+    line_count: usize,
+};
+
+fn copySelectionToClipboard(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    snapshot: diff.DiffSnapshot,
+    state: *const State,
+) !usize {
+    const selected = try selectedText(allocator, snapshot, state);
+    defer allocator.free(selected.bytes);
+    if (selected.bytes.len == 0) return 0;
+    try writeOsc52Clipboard(allocator, io, selected.bytes);
+    return selected.line_count;
+}
+
+fn selectedText(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *const State) !SelectedText {
+    var view = try currentView(allocator, snapshot, state);
+    defer view.deinit(allocator);
+    if (view.rows.len == 0) return .{ .bytes = try allocator.alloc(u8, 0), .line_count = 0 };
+
+    const cursor = @min(state.cursor_row, view.rows.len - 1);
+    const selection_start = if (state.selection_start) |start| @min(start, view.rows.len - 1) else cursor;
+    const start = @min(selection_start, cursor);
+    const end = @max(selection_start, cursor);
+    const file = snapshot.files[state.active_file];
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var line_count: usize = 0;
+    for (start..end + 1) |row_index| {
+        try appendCopyRow(allocator, &out, &line_count, file, view, view.rows[row_index]);
+    }
+    return .{ .bytes = try out.toOwnedSlice(allocator), .line_count = line_count };
+}
+
+fn appendCopyRow(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    line_count: *usize,
+    file: diff.DiffFile,
+    view: tui_view.FileView,
+    row: tui_view.VisualRow,
+) !void {
+    switch (row.kind) {
+        .file_header => {
+            const header = try copyFileHeader(allocator, file, view);
+            defer allocator.free(header);
+            try appendCopyLine(allocator, out, line_count, header);
+        },
+        .hunk_header => try appendCopyLine(allocator, out, line_count, row.hunk_header orelse ""),
+        .fold => {
+            const text = try std.fmt.allocPrint(allocator, "... {d} unmodified lines", .{row.fold_line_count});
+            defer allocator.free(text);
+            try appendCopyLine(allocator, out, line_count, text);
+        },
+        .stacked_code, .file_meta => if (row.line) |line| {
+            try appendDiffLineCopy(allocator, out, line_count, line);
+        },
+        .split_code => try appendSplitCopy(allocator, out, line_count, row),
+    }
+}
+
+fn copyFileHeader(allocator: std.mem.Allocator, file: diff.DiffFile, view: tui_view.FileView) ![]u8 {
+    const stats = try fileStats(allocator, view.deletions, view.additions);
+    defer allocator.free(stats);
+    const path = if (file.old_path) |old|
+        if (util.eql(old, file.path)) try util.dupe(allocator, file.path) else try std.fmt.allocPrint(allocator, "{s} -> {s}", .{ old, file.path })
+    else
+        try util.dupe(allocator, file.path);
+    defer allocator.free(path);
+    if (stats.len == 0) return util.dupe(allocator, path);
+    return std.fmt.allocPrint(allocator, "{s} ({s})", .{ path, stats });
+}
+
+fn appendSplitCopy(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    line_count: *usize,
+    row: tui_view.VisualRow,
+) !void {
+    if (row.left) |left| {
+        if (row.right) |right| {
+            if (left == right) {
+                try appendDiffLineCopy(allocator, out, line_count, left);
+            } else {
+                try appendDiffLineCopy(allocator, out, line_count, left);
+                try appendDiffLineCopy(allocator, out, line_count, right);
+            }
+            return;
+        }
+        try appendDiffLineCopy(allocator, out, line_count, left);
+        return;
+    }
+    if (row.right) |right| try appendDiffLineCopy(allocator, out, line_count, right);
+}
+
+fn appendDiffLineCopy(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    line_count: *usize,
+    line: *const diff.DiffLine,
+) !void {
+    if (line.kind == .meta) {
+        try appendCopyLine(allocator, out, line_count, line.text);
+        return;
+    }
+    const marker: u8 = switch (line.kind) {
+        .add => '+',
+        .delete => '-',
+        .context => ' ',
+        .meta => unreachable,
+    };
+    if (line_count.* > 0) try out.append(allocator, '\n');
+    try out.append(allocator, marker);
+    try out.appendSlice(allocator, line.text);
+    line_count.* += 1;
+}
+
+fn appendCopyLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    line_count: *usize,
+    text: []const u8,
+) !void {
+    if (line_count.* > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, text);
+    line_count.* += 1;
+}
+
+fn writeOsc52Clipboard(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !void {
+    const encoded_len = std.base64.standard.Encoder.calcSize(text.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, text);
+    try writeAll(io, "\x1b]52;c;");
+    try writeAll(io, encoded);
+    try writeAll(io, "\x07");
+}
+
 fn renderFileTree(
     allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
@@ -1175,6 +1351,17 @@ fn gotoAction(key: []const u8, pending_g: bool) GotoAction {
     if (key[0] != 'g') return .none;
     if (pending_g or (key.len >= 2 and key[1] == 'g')) return .top;
     return .pending;
+}
+
+fn isPlainEscape(key: []const u8) bool {
+    return std.mem.eql(u8, key, "\x1b");
+}
+
+fn cancelSelectionMode(state: *State) void {
+    state.help = false;
+    state.pending_g = false;
+    state.selection_start = null;
+    state.copy_notice = .none;
 }
 
 fn jumpToEdge(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, edge: GotoEdge) !void {
@@ -2147,6 +2334,13 @@ test "parse sgr mouse wheel" {
     try std.testing.expectEqual(@as(usize, 5), event.y);
 }
 
+test "parse sgr mouse left drag" {
+    const event = parseSgrMouse("\x1b[<32;12;8M").?;
+    try std.testing.expect(event.isLeftDrag());
+    try std.testing.expectEqual(@as(usize, 12), event.x);
+    try std.testing.expectEqual(@as(usize, 8), event.y);
+}
+
 test "layout body fills rows between status and footer" {
     const layout = Layout.init(.{ .width = 100, .height = 20 });
     try std.testing.expectEqual(@as(usize, 18), layout.body_height);
@@ -2248,12 +2442,159 @@ test "file tree start avoids unsigned underflow at first scroll row" {
     try std.testing.expectEqual(@as(usize, 1), fileTreeStartIndex(20, 4, 5));
 }
 
+test "selected text copies stacked rows as patch text" {
+    var lines = [_]diff.DiffLine{
+        .{ .kind = .context, .old_lineno = 1, .new_lineno = 1, .text = @constCast("keep"), .stable_line_id = @constCast("line_keep") },
+        .{ .kind = .delete, .old_lineno = 2, .new_lineno = null, .text = @constCast("old"), .stable_line_id = @constCast("line_old") },
+        .{ .kind = .add, .old_lineno = null, .new_lineno = 2, .text = @constCast("new"), .stable_line_id = @constCast("line_new") },
+    };
+    var hunks = [_]diff.DiffHunk{.{
+        .header = @constCast("@@ -1,2 +1,2 @@"),
+        .old_start = 1,
+        .old_count = 2,
+        .new_start = 1,
+        .new_count = 2,
+        .lines = lines[0..],
+    }};
+    var files = [_]diff.DiffFile{.{
+        .path = @constCast("src/app.zig"),
+        .old_path = null,
+        .status = .modified,
+        .source = .explicit,
+        .language = null,
+        .is_binary = false,
+        .hunks = hunks[0..],
+        .patch_fingerprint = @constCast("fingerprint"),
+        .patch_text = @constCast(""),
+    }};
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files[0..],
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 3,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = 2,
+        .copy_notice = .none,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+
+    const selected = try selectedText(std.testing.allocator, snapshot, &state);
+    defer std.testing.allocator.free(selected.bytes);
+
+    try std.testing.expectEqual(@as(usize, 2), selected.line_count);
+    try std.testing.expectEqualStrings("-old\n+new", selected.bytes);
+}
+
+test "selected text copies split replacement pair" {
+    var lines = [_]diff.DiffLine{
+        .{ .kind = .delete, .old_lineno = 1, .new_lineno = null, .text = @constCast("old"), .stable_line_id = @constCast("line_old") },
+        .{ .kind = .add, .old_lineno = null, .new_lineno = 1, .text = @constCast("new"), .stable_line_id = @constCast("line_new") },
+    };
+    var hunks = [_]diff.DiffHunk{.{
+        .header = @constCast("@@ -1,1 +1,1 @@"),
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .lines = lines[0..],
+    }};
+    var files = [_]diff.DiffFile{.{
+        .path = @constCast("src/app.zig"),
+        .old_path = null,
+        .status = .modified,
+        .source = .explicit,
+        .language = null,
+        .is_binary = false,
+        .hunks = hunks[0..],
+        .patch_fingerprint = @constCast("fingerprint"),
+        .patch_text = @constCast(""),
+    }};
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files[0..],
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 1,
+        .scroll_row = 0,
+        .mode = .split,
+        .selection_start = null,
+        .copy_notice = .none,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+
+    const selected = try selectedText(std.testing.allocator, snapshot, &state);
+    defer std.testing.allocator.free(selected.bytes);
+
+    try std.testing.expectEqual(@as(usize, 2), selected.line_count);
+    try std.testing.expectEqualStrings("-old\n+new", selected.bytes);
+}
+
 test "goto action tracks gg prefix and G edge jump" {
     try std.testing.expectEqual(GotoAction.pending, gotoAction("g", false));
     try std.testing.expectEqual(GotoAction.top, gotoAction("g", true));
     try std.testing.expectEqual(GotoAction.top, gotoAction("gg", false));
     try std.testing.expectEqual(GotoAction.bottom, gotoAction("G", false));
     try std.testing.expectEqual(GotoAction.none, gotoAction("j", true));
+}
+
+test "plain escape is distinct from escape sequences" {
+    try std.testing.expect(isPlainEscape("\x1b"));
+    try std.testing.expect(!isPlainEscape("\x1b[A"));
+    try std.testing.expect(!isPlainEscape("\x1b[6~"));
+}
+
+test "cancel selection mode clears selection state" {
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 3,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = 1,
+        .copy_notice = .{ .copied = 2 },
+        .help = true,
+        .pending_g = true,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+
+    cancelSelectionMode(&state);
+
+    try std.testing.expectEqual(@as(?usize, null), state.selection_start);
+    try std.testing.expect(!state.help);
+    try std.testing.expect(!state.pending_g);
+    try std.testing.expectEqual(CopyNotice.none, state.copy_notice);
 }
 
 test "center cursor places target row at viewport midpoint" {
@@ -2297,6 +2638,7 @@ test "center cursor places target row at viewport midpoint" {
         .scroll_row = 0,
         .mode = .stacked,
         .selection_start = null,
+        .copy_notice = .none,
         .help = false,
         .pending_g = false,
         .folds = .empty,

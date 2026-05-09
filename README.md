@@ -123,6 +123,8 @@ When stdout is not a TTY, `diffo` renders a static diff screen instead of enteri
 | `r` | Toggle current file reviewed state |
 | `c` | Add a comment at the current diff line |
 | `V` | Start a multi-line selection |
+| `y` | Copy the selected diff rows, or the current row, to the clipboard |
+| `Esc` | Clear the current selection |
 | `u` | Jump to the first unreviewed file |
 | `?` | Toggle help |
 | `q` | Quit |
@@ -132,6 +134,7 @@ Mouse support is enabled in the TUI:
 - Scroll wheel over the diff scrolls the current file.
 - Scroll wheel over the file tree moves between files.
 - Clicking a diff row moves the cursor.
+- Dragging over diff rows extends the selection for copying or commenting.
 - Clicking a file-tree row opens that file.
 
 When running inside tmux, mouse events must be enabled in tmux as well:
