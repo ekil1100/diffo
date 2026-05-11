@@ -166,10 +166,11 @@ diffo comments get cmt_0123456789abcdef
 diffo comments get cmt_0123456789abcdef --json
 ```
 
-清理当前 review target 中已经过期的注释（锚点状态为 `stale` 或 `missing`）：
+清理当前 review target 中已经过期的注释（锚点状态为 `stale` 或 `missing`），或用 `--all` 删除仓库中保存的所有注释：
 
 ```sh
 diffo comments clean
+diffo comments clean --all
 diffo comments clean --dry-run
 diffo comments clean --file src/main.zig
 diffo comments clean --json
