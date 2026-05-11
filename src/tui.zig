@@ -41,6 +41,7 @@ const CopyNotice = union(enum) {
     none,
     copied: usize,
     empty,
+    comment_added,
 };
 
 const Size = struct {
@@ -273,7 +274,9 @@ fn handleEvent(
                         else => return err,
                     };
                     defer if (body) |text| allocator.free(text);
-                    if (body) |text| if (text.len > 0) try addCommentAtCursor(allocator, snapshot.*, store, state, text, author);
+                    if (body) |text| if (text.len > 0) {
+                        if (try addCommentAtCursor(allocator, snapshot.*, store, state, text, author)) state.copy_notice = .comment_added;
+                    };
                     state.selection_start = null;
                 },
                 '[' => if (key.len >= 2 and key[1] == 'f') moveFile(snapshot.*, state, -1),
@@ -380,6 +383,7 @@ fn render(
             .none => try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  V select  y copy  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
         };
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
@@ -1938,13 +1942,13 @@ fn addCommentAtCursor(
     state: *const State,
     body: []const u8,
     author: []const u8,
-) !void {
+) !bool {
     const file = snapshot.files[state.active_file];
     var view = try tui_view.buildFileView(allocator, &file, state.active_file, state.mode, state.folds.items);
     defer view.deinit(allocator);
-    if (state.cursor_row >= view.rows.len) return;
+    if (state.cursor_row >= view.rows.len) return false;
     const row = view.rows[state.cursor_row];
-    const line = row.commentLine() orelse return;
+    const line = row.commentLine() orelse return false;
     const hunk_header = if (row.hunk_index) |idx| file.hunks[idx].header else "";
     var end_line: u32 = 0;
     if (state.selection_start) |start| {
@@ -1953,6 +1957,7 @@ fn addCommentAtCursor(
     }
     var comment = try store.addComment(snapshot.repository.repo_id, snapshot.review_target.target_id, file, line, hunk_header, end_line, body, author);
     defer comment.deinit(allocator);
+    return true;
 }
 
 fn readEvent() ?Event {
@@ -2086,25 +2091,48 @@ const CommentInput = struct {
 
 const CommentInputAction = enum {
     continue_input,
+    incomplete_escape,
     save,
     cancel,
     quit,
 };
 
+const CommentInputResult = struct {
+    action: CommentInputAction,
+    consumed: usize,
+};
+
+const comment_save_sequences = [_][]const u8{
+    "\x1b[13;5u",
+    "\x1b[10;5u",
+    "\x1b[13;5~",
+    "\x1b[10;5~",
+    "\x1b[27;5;13~",
+    "\x1b[27;5;10~",
+};
+
+const comment_navigation_sequences = [_][]const u8{
+    "\x1b[D",
+    "\x1b[C",
+    "\x1b[A",
+    "\x1b[B",
+    "\x1b[3~",
+};
+
 fn handleCommentInputBytes(allocator: std.mem.Allocator, input: *CommentInput, bytes: []const u8) !CommentInputAction {
+    const result = try handleCommentInputBytesPartial(allocator, input, bytes);
+    return if (result.action == .incomplete_escape) .continue_input else result.action;
+}
+
+fn handleCommentInputBytesPartial(allocator: std.mem.Allocator, input: *CommentInput, bytes: []const u8) !CommentInputResult {
     var i: usize = 0;
     while (i < bytes.len) {
         switch (bytes[i]) {
-            3 => return .quit,
+            3 => return .{ .action = .quit, .consumed = i + 1 },
             4 => {},
             27 => {
-                if (std.mem.startsWith(u8, bytes[i..], "\x1b[13;5u") or
-                    std.mem.startsWith(u8, bytes[i..], "\x1b[10;5u"))
-                {
-                    return .save;
-                }
-                if (std.mem.startsWith(u8, bytes[i..], "\x1b[27;5;13~")) return .save;
-                if (std.mem.startsWith(u8, bytes[i..], "\x1b[27;5;10~")) return .save;
+                const remaining = bytes[i..];
+                if (matchingEscapeSequence(remaining, comment_save_sequences[0..])) |len| return .{ .action = .save, .consumed = i + len };
                 if (std.mem.startsWith(u8, bytes[i..], "\x1b[D")) {
                     input.moveLeft();
                     i += 3;
@@ -2130,7 +2158,13 @@ fn handleCommentInputBytes(allocator: std.mem.Allocator, input: *CommentInput, b
                     i += 4;
                     continue;
                 }
-                return .cancel;
+                if (remaining.len == 1) return .{ .action = .cancel, .consumed = i + 1 };
+                if (isEscapeSequencePrefix(remaining, comment_save_sequences[0..]) or
+                    isEscapeSequencePrefix(remaining, comment_navigation_sequences[0..]))
+                {
+                    return .{ .action = .incomplete_escape, .consumed = i };
+                }
+                return .{ .action = .cancel, .consumed = i + 1 };
             },
             '\r' => {
                 try input.appendNewline(allocator);
@@ -2159,7 +2193,31 @@ fn handleCommentInputBytes(allocator: std.mem.Allocator, input: *CommentInput, b
         }
         i += 1;
     }
-    return .continue_input;
+    return .{ .action = .continue_input, .consumed = bytes.len };
+}
+
+fn matchingEscapeSequence(bytes: []const u8, sequences: []const []const u8) ?usize {
+    for (sequences) |sequence| {
+        if (std.mem.startsWith(u8, bytes, sequence)) return sequence.len;
+    }
+    return null;
+}
+
+fn isEscapeSequencePrefix(bytes: []const u8, sequences: []const []const u8) bool {
+    for (sequences) |sequence| {
+        if (bytes.len < sequence.len and std.mem.startsWith(u8, sequence, bytes)) return true;
+    }
+    return false;
+}
+
+fn discardCommentInputPrefix(bytes: *std.ArrayList(u8), count: usize) void {
+    if (count == 0) return;
+    if (count >= bytes.items.len) {
+        bytes.clearRetainingCapacity();
+        return;
+    }
+    std.mem.copyForwards(u8, bytes.items[0 .. bytes.items.len - count], bytes.items[count..]);
+    bytes.items.len -= count;
 }
 
 fn readCommentBody(
@@ -2170,6 +2228,8 @@ fn readCommentBody(
 ) !?[]u8 {
     var input = CommentInput{};
     defer input.deinit(allocator);
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
     try writeAll(io, enable_extended_keyboard);
     defer writeAll(io, disable_extended_keyboard) catch {};
     try drawCommentEditor(allocator, io, input, ansi, palette);
@@ -2177,11 +2237,17 @@ fn readCommentBody(
         var bytes: [64]u8 = undefined;
         const n = try std.posix.read(std.posix.STDIN_FILENO, &bytes);
         if (n == 0) return try input.takeOwned(allocator);
-        switch (try handleCommentInputBytes(allocator, &input, bytes[0..n])) {
-            .continue_input => {},
-            .save => return try input.takeOwned(allocator),
-            .cancel => return null,
-            .quit => return error.Interrupted,
+        try pending.appendSlice(allocator, bytes[0..n]);
+        while (pending.items.len > 0) {
+            const result = try handleCommentInputBytesPartial(allocator, &input, pending.items);
+            discardCommentInputPrefix(&pending, result.consumed);
+            switch (result.action) {
+                .continue_input => break,
+                .incomplete_escape => break,
+                .save => return try input.takeOwned(allocator),
+                .cancel => return null,
+                .quit => return error.Interrupted,
+            }
         }
         try drawCommentEditor(allocator, io, input, ansi, palette);
     }
@@ -2825,6 +2891,84 @@ test "cancel selection mode clears selection state" {
     try std.testing.expectEqual(CopyNotice.none, state.copy_notice);
 }
 
+test "adding comment at cursor persists" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-old();
+        \\+new();
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 0,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = null,
+        .copy_notice = .none,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+    var view = try currentView(allocator, snapshot, &state);
+    defer view.deinit(allocator);
+    for (view.rows, 0..) |row, i| {
+        if (row.commentLine() != null) {
+            state.cursor_row = i;
+            break;
+        }
+    } else return error.TestExpectedEqual;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+    var store = store_mod.Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = try allocator.alloc(store_mod.Comment, 0),
+        .states = try allocator.alloc(store_mod.ReviewState, 0),
+    };
+    defer store.deinit();
+
+    try std.testing.expect(try addCommentAtCursor(allocator, snapshot, &store, &state, "persisted body", "tester"));
+    try std.testing.expectEqual(@as(usize, 1), store.comments.len);
+    try std.testing.expectEqualStrings("persisted body", store.comments[0].body);
+
+    const comments_json = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, store.comments_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(comments_json);
+    try std.testing.expect(std.mem.indexOf(u8, comments_json, "persisted body") != null);
+}
+
 test "center cursor places target row at viewport midpoint" {
     const rows = [_]tui_view.VisualRow{.{ .kind = .file_header }} ** 30;
     const changes = [_]tui_view.ChangeSpan{};
@@ -3080,6 +3224,8 @@ test "comment input accepts common ctrl-enter encodings" {
     const sequences = [_][]const u8{
         "\x1b[13;5u",
         "\x1b[10;5u",
+        "\x1b[13;5~",
+        "\x1b[10;5~",
         "\x1b[27;5;13~",
         "\x1b[27;5;10~",
     };
@@ -3089,6 +3235,25 @@ test "comment input accepts common ctrl-enter encodings" {
         defer input.deinit(allocator);
         try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, sequence));
     }
+}
+
+test "comment input buffers split ctrl-enter escape" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    const first = try handleCommentInputBytesPartial(allocator, &input, "body\x1b[13;");
+    try std.testing.expectEqual(CommentInputAction.incomplete_escape, first.action);
+    try std.testing.expectEqual(@as(usize, 4), first.consumed);
+    try std.testing.expectEqualStrings("body", input.body.items);
+
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    try pending.appendSlice(allocator, "body\x1b[13;");
+    discardCommentInputPrefix(&pending, first.consumed);
+    try pending.appendSlice(allocator, "5u");
+    const second = try handleCommentInputBytesPartial(allocator, &input, pending.items);
+    try std.testing.expectEqual(CommentInputAction.save, second.action);
 }
 
 test "comment input ignores ctrl-d as an editing byte" {
