@@ -447,6 +447,6 @@ const helpText =
     \\  diffo themes validate <file>
     \\
     \\Interactive keys:
-    \\  j/k line, J/K file, n/N change, z/Z fold, v stacked/split, r reviewed, c comment, V select, y copy, Esc clear selection, u unreviewed, ? help, q quit
+    \\  j/k line, J/K file, n/N change, C unfold/fold mode, z/Z folds, v stacked/split, r reviewed, c comment, V select, y copy, Esc clear selection, u unreviewed, ? help, q quit
     \\
 ;

@@ -11,12 +11,14 @@ const tui_view = @import("tui_view.zig");
 const util = @import("util.zig");
 
 pub const DiffMode = tui_view.ViewMode;
+const FoldMode = tui_view.FoldMode;
 
 const State = struct {
     active_file: usize = 0,
     cursor_row: usize = 0,
     scroll_row: usize = 0,
     mode: DiffMode = .stacked,
+    fold_mode: FoldMode = .unfold,
     selection_start: ?usize = null,
     copy_notice: CopyNotice = .none,
     help: bool = false,
@@ -132,6 +134,7 @@ pub fn run(
 
     var state = State.init(allocator, io, snapshot.*);
     defer state.deinit(allocator);
+    try jumpToFirstChange(allocator, snapshot.*, &state);
     if (builtin.os.tag == .windows) {
         const screen = try render(allocator, snapshot.*, store.*, &state, false);
         defer allocator.free(screen);
@@ -240,12 +243,13 @@ fn handleEvent(
             switch (key[0]) {
                 'j' => try moveLine(allocator, snapshot.*, state, 1),
                 'k' => try moveLine(allocator, snapshot.*, state, -1),
-                'J' => moveFile(snapshot.*, state, 1),
-                'K' => moveFile(snapshot.*, state, -1),
+                'J' => try moveFile(allocator, snapshot.*, state, 1),
+                'K' => try moveFile(allocator, snapshot.*, state, -1),
                 'n' => try jumpChange(allocator, snapshot.*, state, 1),
                 'N' => try jumpChange(allocator, snapshot.*, state, -1),
                 'z' => try toggleCurrentFold(allocator, snapshot.*, state),
                 'Z' => try toggleAllFolds(allocator, snapshot.*, state),
+                'C' => try toggleFoldMode(allocator, snapshot.*, state),
                 'v' => {
                     state.mode = if (state.mode == .stacked) .split else .stacked;
                     clampCursor(allocator, snapshot.*, state) catch {};
@@ -256,7 +260,7 @@ fn handleEvent(
                     const copied = try copySelectionToClipboard(allocator, io, snapshot.*, state);
                     state.copy_notice = if (copied == 0) .empty else .{ .copied = copied };
                 },
-                'u' => jumpUnreviewed(snapshot.*, store.*, state),
+                'u' => try jumpUnreviewed(allocator, snapshot.*, store.*, state),
                 'r' => {
                     const file = snapshot.files[state.active_file];
                     const reviewed = !store.isReviewed(file.path, file.patch_fingerprint, snapshot.review_target.target_id);
@@ -279,8 +283,8 @@ fn handleEvent(
                     };
                     state.selection_start = null;
                 },
-                '[' => if (key.len >= 2 and key[1] == 'f') moveFile(snapshot.*, state, -1),
-                ']' => if (key.len >= 2 and key[1] == 'f') moveFile(snapshot.*, state, 1),
+                '[' => if (key.len >= 2 and key[1] == 'f') try moveFile(allocator, snapshot.*, state, -1),
+                ']' => if (key.len >= 2 and key[1] == 'f') try moveFile(allocator, snapshot.*, state, 1),
                 else => {},
             }
             return false;
@@ -292,11 +296,11 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     const layout = Layout.init(terminalSize());
     const in_sidebar = layout.sidebar_width > 0 and mouse.x >= layout.sidebar_x;
     if (mouse.isWheelUp()) {
-        if (in_sidebar) moveFile(snapshot, state, -3) else try scrollLines(allocator, snapshot, state, -3);
+        if (in_sidebar) try moveFileInLayout(allocator, snapshot, state, -3, layout) else try scrollLines(allocator, snapshot, state, -3);
         return;
     }
     if (mouse.isWheelDown()) {
-        if (in_sidebar) moveFile(snapshot, state, 3) else try scrollLines(allocator, snapshot, state, 3);
+        if (in_sidebar) try moveFileInLayout(allocator, snapshot, state, 3, layout) else try scrollLines(allocator, snapshot, state, 3);
         return;
     }
     const left_drag = mouse.isLeftDrag();
@@ -310,9 +314,8 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
         const idx = start + mouse.y - layout.body_y - 1;
         if (idx < snapshot.files.len) {
             state.active_file = idx;
-            state.cursor_row = 0;
-            state.scroll_row = 0;
             state.selection_start = null;
+            _ = try jumpToFirstChangeInCurrentFileInLayout(allocator, snapshot, state, layout);
         }
     } else {
         var view = try currentView(allocator, snapshot, state);
@@ -375,15 +378,15 @@ fn render(
     }
 
     if (state.help) {
-        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  z/Z fold  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
+        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  C unfold/fold  z/Z folds  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
     } else {
         const active_file = snapshot.files[state.active_file];
         const syntax_mode = activeSyntaxMode(snapshot, active_file);
         const footer = switch (state.copy_notice) {
-            .none => try std.fmt.allocPrint(allocator, "mode={s} target={s} syntax={s}  ? help  V select  y copy  n/N change  z fold  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .none => try std.fmt.allocPrint(allocator, "mode={s}/{s} target={s} syntax={s}  ? help  C unfold/fold  z/Z folds  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s}/{s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
         };
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
@@ -537,7 +540,8 @@ fn renderFoldRow(
     palette: theme.ThemeTokens,
 ) ![]u8 {
     const caret = if (row.fold_expanded) "v" else ">";
-    const text = try std.fmt.allocPrint(allocator, " {s}  {d} unmodified lines", .{ caret, row.fold_line_count });
+    const label = if (row.fold_expanded) "context lines" else "hidden lines";
+    const text = try std.fmt.allocPrint(allocator, " {s}  {d} {s}", .{ caret, row.fold_line_count, label });
     defer allocator.free(text);
     return styleCell(allocator, text, width, ansi, if (selected) palette.bg_selected else palette.bg_panel, palette.fg_muted);
 }
@@ -1196,7 +1200,8 @@ fn appendCopyRow(
         },
         .hunk_header => try appendCopyLine(allocator, out, line_count, row.hunk_header orelse ""),
         .fold => {
-            const text = try std.fmt.allocPrint(allocator, "... {d} unmodified lines", .{row.fold_line_count});
+            const label = if (row.fold_expanded) "context lines" else "hidden lines";
+            const text = try std.fmt.allocPrint(allocator, "... {d} {s}", .{ row.fold_line_count, label });
             defer allocator.free(text);
             try appendCopyLine(allocator, out, line_count, text);
         },
@@ -1384,12 +1389,15 @@ fn jumpToEdge(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: 
     try ensureCursorVisible(allocator, snapshot, view, state);
 }
 
-fn moveFile(snapshot: diff.DiffSnapshot, state: *State, delta: isize) void {
+fn moveFile(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
+    try moveFileInLayout(allocator, snapshot, state, delta, Layout.init(terminalSize()));
+}
+
+fn moveFileInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize, layout: Layout) !void {
     if (snapshot.files.len == 0) return;
     state.active_file = moveIndex(state.active_file, snapshot.files.len, delta);
-    state.cursor_row = 0;
-    state.scroll_row = 0;
     state.selection_start = null;
+    _ = try jumpToFirstChangeInCurrentFileInLayout(allocator, snapshot, state, layout);
 }
 
 fn moveIndex(current: usize, len: usize, delta: isize) usize {
@@ -1801,12 +1809,13 @@ fn splitCellHeight(allocator: std.mem.Allocator, line: *const diff.DiffLine, wid
     return wrapAnsiTextLineCount(allocator, line.text, wrap_widths.first, wrap_widths.continuation);
 }
 
-fn jumpUnreviewed(snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *State) void {
+fn jumpUnreviewed(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *State) !void {
+    const layout = Layout.init(terminalSize());
     for (snapshot.files, 0..) |file, i| {
         if (!store.isReviewed(file.path, file.patch_fingerprint, snapshot.review_target.target_id)) {
             state.active_file = i;
-            state.cursor_row = 0;
-            state.scroll_row = 0;
+            state.selection_start = null;
+            _ = try jumpToFirstChangeInCurrentFileInLayout(allocator, snapshot, state, layout);
             return;
         }
     }
@@ -1822,7 +1831,7 @@ fn fileTreeStartIndex(file_count: usize, active_file: usize, height: usize) usiz
 }
 
 fn currentView(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *const State) !tui_view.FileView {
-    return tui_view.buildFileView(allocator, &snapshot.files[state.active_file], state.active_file, state.mode, state.folds.items);
+    return tui_view.buildFileView(allocator, &snapshot.files[state.active_file], state.active_file, state.mode, state.fold_mode, state.folds.items);
 }
 
 fn clampCursor(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
@@ -1836,6 +1845,37 @@ fn clampCursor(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     state.cursor_row = @min(state.cursor_row, view.rows.len - 1);
     state.scroll_row = @min(state.scroll_row, view.rows.len - 1);
     try ensureCursorVisible(allocator, snapshot, view, state);
+}
+
+fn jumpToFirstChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
+    try jumpToFirstChangeInLayout(allocator, snapshot, state, Layout.init(terminalSize()));
+}
+
+fn jumpToFirstChangeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, layout: Layout) !void {
+    for (snapshot.files, 0..) |_, file_index| {
+        state.active_file = file_index;
+        state.selection_start = null;
+
+        if (try jumpToFirstChangeInCurrentFileInLayout(allocator, snapshot, state, layout)) return;
+    }
+
+    state.active_file = 0;
+    state.cursor_row = 0;
+    state.scroll_row = 0;
+    state.selection_start = null;
+}
+
+fn jumpToFirstChangeInCurrentFileInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, layout: Layout) !bool {
+    state.cursor_row = 0;
+    state.scroll_row = 0;
+
+    var view = try currentView(allocator, snapshot, state);
+    defer view.deinit(allocator);
+    if (view.changes.len == 0) return false;
+
+    state.cursor_row = view.changes[0].start_row;
+    try centerCursorInLayout(allocator, snapshot, view, state, layout);
+    return true;
 }
 
 fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
@@ -1853,10 +1893,12 @@ fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: 
 }
 
 fn toggleCurrentFold(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
+    if (state.fold_mode == .unfold) return;
     try toggleCurrentFoldInLayout(allocator, snapshot, state, Layout.init(terminalSize()));
 }
 
 fn toggleCurrentFoldInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, layout: Layout) !void {
+    if (state.fold_mode == .unfold) return;
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
     if (state.cursor_row >= view.rows.len) return;
@@ -1889,10 +1931,12 @@ fn findFoldRowById(view: tui_view.FileView, id: tui_view.FoldId) ?usize {
 }
 
 fn toggleAllFolds(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
+    if (state.fold_mode == .unfold) return;
     try toggleAllFoldsInLayout(allocator, snapshot, state, Layout.init(terminalSize()));
 }
 
 fn toggleAllFoldsInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, layout: Layout) !void {
+    if (state.fold_mode == .unfold) return;
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
     const target = findFoldTarget(view, state.cursor_row);
@@ -1915,6 +1959,25 @@ fn toggleAllFoldsInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
     try clampCursor(allocator, snapshot, state);
 }
 
+fn toggleFoldMode(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
+    try toggleFoldModeInLayout(allocator, snapshot, state, Layout.init(terminalSize()));
+}
+
+fn toggleFoldModeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, layout: Layout) !void {
+    var view = try currentView(allocator, snapshot, state);
+    defer view.deinit(allocator);
+    const target = findFoldTarget(view, state.cursor_row);
+    const cursor_anchor = try captureFoldToggleAnchor(allocator, snapshot, state, view, target, layout);
+
+    state.fold_mode = if (state.fold_mode == .unfold) .fold else .unfold;
+    if (state.fold_mode == .fold) state.folds.clearRetainingCapacity();
+
+    var updated = try currentView(allocator, snapshot, state);
+    defer updated.deinit(allocator);
+    if (try restoreCodeCursorAnchor(allocator, snapshot, state, updated, cursor_anchor, layout)) return;
+    try clampCursor(allocator, snapshot, state);
+}
+
 fn toggleFold(state: *State, allocator: std.mem.Allocator, id: tui_view.FoldId) !void {
     for (state.folds.items) |*entry| {
         if (entry.id.eql(id)) {
@@ -1922,7 +1985,8 @@ fn toggleFold(state: *State, allocator: std.mem.Allocator, id: tui_view.FoldId) 
             return;
         }
     }
-    try state.folds.append(allocator, .{ .id = id, .state = .expanded });
+    const next_state: tui_view.FoldState = if (tui_view.foldState(state.folds.items, id) == .expanded) .collapsed else .expanded;
+    try state.folds.append(allocator, .{ .id = id, .state = next_state });
 }
 
 fn setFold(state: *State, allocator: std.mem.Allocator, id: tui_view.FoldId, fold_state: tui_view.FoldState) !void {
@@ -1944,7 +2008,7 @@ fn addCommentAtCursor(
     author: []const u8,
 ) !bool {
     const file = snapshot.files[state.active_file];
-    var view = try tui_view.buildFileView(allocator, &file, state.active_file, state.mode, state.folds.items);
+    var view = try tui_view.buildFileView(allocator, &file, state.active_file, state.mode, state.fold_mode, state.folds.items);
     defer view.deinit(allocator);
     if (state.cursor_row >= view.rows.len) return false;
     const row = view.rows[state.cursor_row];
@@ -3079,6 +3143,7 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
         .cursor_row = 0,
         .scroll_row = 0,
         .mode = .stacked,
+        .fold_mode = .fold,
         .selection_start = null,
         .copy_notice = .none,
         .help = false,
@@ -3092,19 +3157,10 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
     var before = try currentView(allocator, snapshot, &state);
     defer before.deinit(allocator);
     var first_fold_row: ?usize = null;
-    var line_115_row: ?usize = null;
     for (before.rows, 0..) |row, i| {
         if (row.kind == .fold and first_fold_row == null) first_fold_row = i;
-        if (row.line) |line| {
-            if (util.eql(line.text, "line 115")) {
-                line_115_row = i;
-                break;
-            }
-        }
     }
     const fold_row = first_fold_row orelse return error.TestExpectedEqual;
-    const line_115_before = line_115_row orelse return error.TestExpectedEqual;
-    const before_offset = try visualHeightBetween(allocator, snapshot, &state, before, state.scroll_row, line_115_before, layout);
 
     try toggleCurrentFoldInLayout(allocator, snapshot, &state, layout);
 
@@ -3122,6 +3178,7 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
         .cursor_row = fold_row,
         .scroll_row = 0,
         .mode = .stacked,
+        .fold_mode = .fold,
         .selection_start = null,
         .copy_notice = .none,
         .help = false,
@@ -3130,6 +3187,19 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
         .syntax_cache = undefined,
     };
     defer fold_state.folds.deinit(allocator);
+    var before_fold = try currentView(allocator, snapshot, &fold_state);
+    defer before_fold.deinit(allocator);
+    var collapsed_line_115_row: ?usize = null;
+    for (before_fold.rows, 0..) |row, i| {
+        if (row.line) |line| {
+            if (util.eql(line.text, "line 115")) {
+                collapsed_line_115_row = i;
+                break;
+            }
+        }
+    }
+    const line_115_collapsed = collapsed_line_115_row orelse return error.TestExpectedEqual;
+    const collapsed_offset = try visualHeightBetween(allocator, snapshot, &fold_state, before_fold, fold_state.scroll_row, line_115_collapsed, layout);
 
     try toggleCurrentFoldInLayout(allocator, snapshot, &fold_state, layout);
 
@@ -3139,13 +3209,14 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
     const fold_line = after_fold.rows[fold_state.cursor_row].line orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("line 115", fold_line.text);
     const fold_offset = try visualHeightBetween(allocator, snapshot, &fold_state, after_fold, fold_state.scroll_row, fold_state.cursor_row, layout);
-    try std.testing.expectEqual(before_offset, fold_offset);
+    try std.testing.expectEqual(collapsed_offset, fold_offset);
 
     var all_state: State = .{
         .active_file = 0,
         .cursor_row = 0,
         .scroll_row = 0,
         .mode = .stacked,
+        .fold_mode = .fold,
         .selection_start = null,
         .copy_notice = .none,
         .help = false,
@@ -3157,13 +3228,211 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
 
     try toggleAllFoldsInLayout(allocator, snapshot, &all_state, layout);
 
-    var after_all = try currentView(allocator, snapshot, &all_state);
-    defer after_all.deinit(allocator);
-    try ensureRenderViewport(allocator, snapshot, after_all, &all_state, layout);
-    const all_line = after_all.rows[all_state.cursor_row].line orelse return error.TestExpectedEqual;
+    var after_all_expanded = try currentView(allocator, snapshot, &all_state);
+    defer after_all_expanded.deinit(allocator);
+    try ensureRenderViewport(allocator, snapshot, after_all_expanded, &all_state, layout);
+    const all_line = after_all_expanded.rows[all_state.cursor_row].line orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("line 115", all_line.text);
-    const all_offset = try visualHeightBetween(allocator, snapshot, &all_state, after_all, all_state.scroll_row, all_state.cursor_row, layout);
-    try std.testing.expectEqual(before_offset, all_offset);
+    const all_offset = try visualHeightBetween(allocator, snapshot, &all_state, after_all_expanded, all_state.scroll_row, all_state.cursor_row, layout);
+    try std.testing.expectEqual(collapsed_offset, all_offset);
+
+    try toggleAllFoldsInLayout(allocator, snapshot, &all_state, layout);
+
+    var after_all_collapsed = try currentView(allocator, snapshot, &all_state);
+    defer after_all_collapsed.deinit(allocator);
+    var collapsed_fold = false;
+    for (after_all_collapsed.rows) |row| {
+        if (row.kind == .fold and !row.fold_expanded) {
+            collapsed_fold = true;
+            break;
+        }
+    }
+    try std.testing.expect(collapsed_fold);
+}
+
+test "fold mode toggle switches between unfolded rows and collapsed folds" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,18 +1,18 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\ five
+        \\ six
+        \\ six-a
+        \\ six-b
+        \\ six-c
+        \\ six-d
+        \\-old();
+        \\+new();
+        \\ seven
+        \\ eight
+        \\ nine
+        \\ ten
+        \\ eleven
+        \\ twelve
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{ .syntax_cache = undefined };
+    defer state.folds.deinit(allocator);
+    const layout = Layout.init(.{ .width = 80, .height = 24 });
+
+    var unfolded = try currentView(allocator, snapshot, &state);
+    defer unfolded.deinit(allocator);
+    try std.testing.expectEqual(@as(?usize, null), findFoldTarget(unfolded, 0));
+
+    try toggleFoldModeInLayout(allocator, snapshot, &state, layout);
+    try std.testing.expectEqual(FoldMode.fold, state.fold_mode);
+    try std.testing.expectEqual(@as(usize, 0), state.folds.items.len);
+
+    var folded = try currentView(allocator, snapshot, &state);
+    defer folded.deinit(allocator);
+    const fold_row = findFoldTarget(folded, 1) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!folded.rows[fold_row].fold_expanded);
+
+    try toggleFoldModeInLayout(allocator, snapshot, &state, layout);
+    try std.testing.expectEqual(FoldMode.unfold, state.fold_mode);
+
+    var unfolded_again = try currentView(allocator, snapshot, &state);
+    defer unfolded_again.deinit(allocator);
+    var fold_count: usize = 0;
+    for (unfolded_again.rows) |row| {
+        if (row.kind == .fold) fold_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), fold_count);
+}
+
+test "initial cursor jumps to first change" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,8 +1,8 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\-old();
+        \\+new();
+        \\ five
+        \\ six
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{ .syntax_cache = undefined };
+    defer state.folds.deinit(allocator);
+
+    try jumpToFirstChangeInLayout(allocator, snapshot, &state, Layout.init(.{ .width = 80, .height = 12 }));
+
+    var view = try currentView(allocator, snapshot, &state);
+    defer view.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), state.active_file);
+    try std.testing.expectEqual(view.changes[0].start_row, state.cursor_row);
+    const line = view.rows[state.cursor_row].line orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(diff.DiffLineKind.delete, line.kind);
+    try std.testing.expectEqualStrings("old();", line.text);
+}
+
+test "moving files jumps to first change in target file" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,3 +1,3 @@
+        \\ one
+        \\-old_a();
+        \\+new_a();
+        \\ two
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1,7 +1,7 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\-old_b();
+        \\+new_b();
+        \\ five
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{ .syntax_cache = undefined };
+    defer state.folds.deinit(allocator);
+
+    try moveFileInLayout(allocator, snapshot, &state, 1, Layout.init(.{ .width = 80, .height = 12 }));
+
+    var view = try currentView(allocator, snapshot, &state);
+    defer view.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.active_file);
+    try std.testing.expectEqual(view.changes[0].start_row, state.cursor_row);
+    const line = view.rows[state.cursor_row].line orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(diff.DiffLineKind.delete, line.kind);
+    try std.testing.expectEqualStrings("old_b();", line.text);
 }
 
 test "comment input backspace removes utf8 character" {

@@ -117,8 +117,9 @@ When stdout is not a TTY, `diffo` renders a static diff screen instead of enteri
 | `PageUp` / `PageDown` | Scroll by a larger step |
 | `J` / `K` | Move to next / previous file |
 | `n` / `N` | Jump to next / previous change |
-| `z` | Toggle the fold at the cursor |
-| `Z` | Toggle all folds in the current file |
+| `C` | Toggle unfold / fold mode |
+| `z` | Toggle the fold at the cursor in fold mode |
+| `Z` | Toggle all folds in the current file in fold mode |
 | `v` | Toggle stacked / split diff view |
 | `r` | Toggle current file reviewed state |
 | `c` | Add a comment at the current diff line |
