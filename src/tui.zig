@@ -354,7 +354,7 @@ fn render(
     try out.appendSlice(allocator, clear_eol);
     try out.append(allocator, '\n');
 
-    const diff_lines = try renderDiffLines(allocator, state, snapshot.files[state.active_file], state.active_file, store, view, layout.main_width, layout.body_height, ansi, palette);
+    const diff_lines = try renderDiffLines(allocator, state, snapshot.files[state.active_file], state.active_file, store, snapshot.review_target.target_id, view, layout.main_width, layout.body_height, ansi, palette);
     defer {
         for (diff_lines) |line| allocator.free(line);
         allocator.free(diff_lines);
@@ -425,6 +425,7 @@ fn renderDiffLines(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     view: tui_view.FileView,
     width: usize,
     height: usize,
@@ -442,7 +443,7 @@ fn renderDiffLines(
     const line_width = lineNumberWidth(file);
     for (start..end) |row_index| {
         if (lines.items.len >= height) break;
-        const rendered = try renderVisualRowLines(allocator, state, file, file_index, store, view, view.rows[row_index], row_index, width, line_width, height - lines.items.len, ansi, palette);
+        const rendered = try renderVisualRowLines(allocator, state, file, file_index, store, target_id, view, view.rows[row_index], row_index, width, line_width, height - lines.items.len, ansi, palette);
         defer allocator.free(rendered);
         for (rendered) |line| try lines.append(allocator, line);
     }
@@ -455,6 +456,7 @@ fn renderVisualRowLines(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     view: tui_view.FileView,
     row: tui_view.VisualRow,
     row_index: usize,
@@ -472,9 +474,9 @@ fn renderVisualRowLines(
         .fold => return oneRenderedLine(allocator, try renderFoldRow(allocator, row, width, selected, ansi, palette)),
         .stacked_code, .file_meta => {
             const line = row.line orelse return oneRenderedLine(allocator, try renderPanelRow(allocator, "", width, selected, ansi, palette));
-            return renderStackedCodeRows(allocator, state, file, file_index, store, line, width, line_width, selected, max_lines, ansi, palette);
+            return renderStackedCodeRows(allocator, state, file, file_index, store, target_id, line, width, line_width, selected, max_lines, ansi, palette);
         },
-        .split_code => return renderSplitCodeRows(allocator, state, file, file_index, store, row, width, line_width, selected, max_lines, ansi, palette),
+        .split_code => return renderSplitCodeRows(allocator, state, file, file_index, store, target_id, row, width, line_width, selected, max_lines, ansi, palette),
     }
 }
 
@@ -552,6 +554,7 @@ fn renderStackedCodeRow(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     line: *const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -559,7 +562,7 @@ fn renderStackedCodeRow(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
-    const rows = try renderStackedCodeRows(allocator, state, file, file_index, store, line, width, line_width, selected, 1, ansi, palette);
+    const rows = try renderStackedCodeRows(allocator, state, file, file_index, store, target_id, line, width, line_width, selected, 1, ansi, palette);
     defer allocator.free(rows);
     return rows[0];
 }
@@ -570,6 +573,7 @@ fn renderStackedCodeRows(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     line: *const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -587,7 +591,7 @@ fn renderStackedCodeRows(
         .delete => "|",
         else => " ",
     };
-    const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
+    const comment_mark = if (lineHasComment(store, file, line, target_id)) "!" else " ";
     const prefix = try std.fmt.allocPrint(allocator, "{s}{s} {s}  ", .{ bar, comment_mark, label });
     defer allocator.free(prefix);
     const wrap_widths = lineWrapWidths(width, prefix.len, line.text);
@@ -790,6 +794,7 @@ fn renderSplitCodeRow(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     row: tui_view.VisualRow,
     width: usize,
     line_width: usize,
@@ -797,7 +802,7 @@ fn renderSplitCodeRow(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
-    const rows = try renderSplitCodeRows(allocator, state, file, file_index, store, row, width, line_width, selected, 1, ansi, palette);
+    const rows = try renderSplitCodeRows(allocator, state, file, file_index, store, target_id, row, width, line_width, selected, 1, ansi, palette);
     defer allocator.free(rows);
     return rows[0];
 }
@@ -808,6 +813,7 @@ fn renderSplitCodeRows(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     row: tui_view.VisualRow,
     width: usize,
     line_width: usize,
@@ -818,8 +824,8 @@ fn renderSplitCodeRows(
 ) ![][]u8 {
     if (max_lines == 0) return allocator.alloc([]u8, 0);
     if (width < 32) {
-        if (row.right) |right| return renderStackedCodeRows(allocator, state, file, file_index, store, right, width, line_width, selected, max_lines, ansi, palette);
-        if (row.left) |left| return renderStackedCodeRows(allocator, state, file, file_index, store, left, width, line_width, selected, max_lines, ansi, palette);
+        if (row.right) |right| return renderStackedCodeRows(allocator, state, file, file_index, store, target_id, right, width, line_width, selected, max_lines, ansi, palette);
+        if (row.left) |left| return renderStackedCodeRows(allocator, state, file, file_index, store, target_id, left, width, line_width, selected, max_lines, ansi, palette);
         return oneRenderedLine(allocator, try renderPanelRow(allocator, "", width, selected, ansi, palette));
     }
 
@@ -839,12 +845,12 @@ fn renderSplitCodeRows(
     const left_inline_ranges = if (pair_ranges) |ranges| ranges.old else empty_inline_ranges;
     const right_inline_ranges = if (pair_ranges) |ranges| ranges.new else empty_inline_ranges;
 
-    const left_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.left, side_width, line_width, selected, max_lines, left_inline_ranges, ansi, palette);
+    const left_rows = try renderSplitCellRows(allocator, state, file, file_index, store, target_id, row.left, side_width, line_width, selected, max_lines, left_inline_ranges, ansi, palette);
     defer {
         for (left_rows) |line| allocator.free(line);
         allocator.free(left_rows);
     }
-    const right_rows = try renderSplitCellRows(allocator, state, file, file_index, store, row.right, right_width, line_width, selected, max_lines, right_inline_ranges, ansi, palette);
+    const right_rows = try renderSplitCellRows(allocator, state, file, file_index, store, target_id, row.right, right_width, line_width, selected, max_lines, right_inline_ranges, ansi, palette);
     defer {
         for (right_rows) |line| allocator.free(line);
         allocator.free(right_rows);
@@ -872,6 +878,7 @@ fn renderSplitCell(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     maybe_line: ?*const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -879,7 +886,7 @@ fn renderSplitCell(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
-    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, maybe_line, width, line_width, selected, 1, &.{}, ansi, palette);
+    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, target_id, maybe_line, width, line_width, selected, 1, &.{}, ansi, palette);
     defer allocator.free(rows);
     return rows[0];
 }
@@ -890,6 +897,7 @@ fn renderSplitCellRows(
     file: diff.DiffFile,
     file_index: usize,
     store: store_mod.Store,
+    target_id: []const u8,
     maybe_line: ?*const diff.DiffLine,
     width: usize,
     line_width: usize,
@@ -907,7 +915,7 @@ fn renderSplitCellRows(
         defer allocator.free(highlighted);
         const inline_highlighted = try applyInlineRanges(allocator, highlighted, line.text, inline_ranges, ansi, rowBg(selected, line.kind, palette), inlineBg(selected, line.kind, palette));
         defer allocator.free(inline_highlighted);
-        const comment_mark = if (lineHasComment(store, file, line)) "!" else " ";
+        const comment_mark = if (lineHasComment(store, file, line, target_id)) "!" else " ";
         const prefix = try std.fmt.allocPrint(allocator, "{s} {s}  ", .{ comment_mark, label });
         defer allocator.free(prefix);
         const wrap_widths = lineWrapWidths(width, prefix.len, line.text);
@@ -1074,7 +1082,7 @@ fn applyInlineRanges(
     return out.toOwnedSlice(allocator);
 }
 
-fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff.DiffLine) bool {
+fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff.DiffLine, target_id: []const u8) bool {
     const line_number = switch (line.kind) {
         .delete => line.old_lineno,
         .add => line.new_lineno,
@@ -1083,8 +1091,12 @@ fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff
     } orelse return false;
     const side = if (line.kind == .delete) "old" else "new";
     for (store.comments) |comment| {
+        if (!util.eql(comment.review_target_id, target_id)) continue;
         if (!util.eql(comment.file_path, file.path)) continue;
-        if (comment.start_line != line_number) continue;
+        const comment_end = if (comment.end_line == 0) comment.start_line else comment.end_line;
+        const start = @min(comment.start_line, comment_end);
+        const end = @max(comment.start_line, comment_end);
+        if (line_number < start or line_number > end) continue;
         if (util.eql(comment.side, side) or line.kind == .context) return true;
     }
     return false;
@@ -1310,7 +1322,7 @@ fn renderFileTree(
     const end = @min(snapshot.files.len, start + height - 1);
     for (snapshot.files[start..end], start..) |file, i| {
         const reviewed = store.isReviewed(file.path, file.patch_fingerprint, snapshot.review_target.target_id);
-        const comments = store.commentCount(file.path);
+        const comments = store.commentCount(file.path, snapshot.review_target.target_id);
         const active = if (i == state.active_file) ">" else " ";
         const mark = if (reviewed) "x" else ".";
         const path_width = if (width > 12) width - 12 else width;
@@ -2011,17 +2023,49 @@ fn addCommentAtCursor(
     var view = try tui_view.buildFileView(allocator, &file, state.active_file, state.mode, state.fold_mode, state.folds.items);
     defer view.deinit(allocator);
     if (state.cursor_row >= view.rows.len) return false;
-    const row = view.rows[state.cursor_row];
-    const line = row.commentLine() orelse return false;
-    const hunk_header = if (row.hunk_index) |idx| file.hunks[idx].header else "";
-    var end_line: u32 = 0;
-    if (state.selection_start) |start| {
-        const last_row_index = @min(@max(start, state.cursor_row), view.rows.len - 1);
-        if (view.rows[last_row_index].commentLine()) |last| end_line = if (last.kind == .delete) (last.old_lineno orelse 0) else (last.new_lineno orelse last.old_lineno orelse 0);
-    }
-    var comment = try store.addComment(snapshot.repository.repo_id, snapshot.review_target.target_id, file, line, hunk_header, end_line, body, author);
+    const anchor = selectedCommentAnchor(file, view, state) orelse return false;
+    var comment = try store.addComment(snapshot.repository.repo_id, snapshot.review_target.target_id, file, anchor.line, anchor.hunk_header, anchor.end_line, body, author);
     defer comment.deinit(allocator);
     return true;
+}
+
+const CommentAnchor = struct {
+    line: *const diff.DiffLine,
+    hunk_header: []const u8,
+    end_line: u32,
+};
+
+fn selectedCommentAnchor(file: diff.DiffFile, view: tui_view.FileView, state: *const State) ?CommentAnchor {
+    if (view.rows.len == 0) return null;
+
+    const cursor = @min(state.cursor_row, view.rows.len - 1);
+    const selection_start = if (state.selection_start) |start| @min(start, view.rows.len - 1) else cursor;
+    const start = @min(selection_start, cursor);
+    const end = @max(selection_start, cursor);
+
+    var first_line: ?*const diff.DiffLine = null;
+    var first_hunk_header: []const u8 = "";
+    var last_line: ?*const diff.DiffLine = null;
+    for (start..end + 1) |row_index| {
+        const row = view.rows[row_index];
+        const line = row.commentLine() orelse continue;
+        if (first_line == null) {
+            first_line = line;
+            first_hunk_header = if (row.hunk_index) |idx| file.hunks[idx].header else "";
+        }
+        last_line = line;
+    }
+
+    const line = first_line orelse return null;
+    return .{
+        .line = line,
+        .hunk_header = first_hunk_header,
+        .end_line = if (last_line) |last| diffLineNumber(last) else 0,
+    };
+}
+
+fn diffLineNumber(line: *const diff.DiffLine) u32 {
+    return if (line.kind == .delete) (line.old_lineno orelse 0) else (line.new_lineno orelse line.old_lineno orelse 0);
 }
 
 fn readEvent() ?Event {
@@ -2183,6 +2227,8 @@ const comment_navigation_sequences = [_][]const u8{
     "\x1b[3~",
 };
 
+const escape_sequence_timeout_ms: i32 = 35;
+
 fn handleCommentInputBytes(allocator: std.mem.Allocator, input: *CommentInput, bytes: []const u8) !CommentInputAction {
     const result = try handleCommentInputBytesPartial(allocator, input, bytes);
     return if (result.action == .incomplete_escape) .continue_input else result.action;
@@ -2222,12 +2268,12 @@ fn handleCommentInputBytesPartial(allocator: std.mem.Allocator, input: *CommentI
                     i += 4;
                     continue;
                 }
-                if (remaining.len == 1) return .{ .action = .cancel, .consumed = i + 1 };
                 if (isEscapeSequencePrefix(remaining, comment_save_sequences[0..]) or
                     isEscapeSequencePrefix(remaining, comment_navigation_sequences[0..]))
                 {
                     return .{ .action = .incomplete_escape, .consumed = i };
                 }
+                if (remaining.len == 1) return .{ .action = .incomplete_escape, .consumed = i };
                 return .{ .action = .cancel, .consumed = i + 1 };
             },
             '\r' => {
@@ -2307,7 +2353,11 @@ fn readCommentBody(
             discardCommentInputPrefix(&pending, result.consumed);
             switch (result.action) {
                 .continue_input => break,
-                .incomplete_escape => break,
+                .incomplete_escape => {
+                    if (try appendPendingInputIfReady(allocator, &pending, escape_sequence_timeout_ms)) continue;
+                    if (isPlainEscape(pending.items)) return null;
+                    break;
+                },
                 .save => return try input.takeOwned(allocator),
                 .cancel => return null,
                 .quit => return error.Interrupted,
@@ -2315,6 +2365,21 @@ fn readCommentBody(
         }
         try drawCommentEditor(allocator, io, input, ansi, palette);
     }
+}
+
+fn appendPendingInputIfReady(allocator: std.mem.Allocator, pending: *std.ArrayList(u8), timeout_ms: i32) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = std.posix.STDIN_FILENO,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    if ((try std.posix.poll(&fds, timeout_ms)) == 0) return false;
+
+    var bytes: [64]u8 = undefined;
+    const n = try std.posix.read(std.posix.STDIN_FILENO, &bytes);
+    if (n == 0) return false;
+    try pending.appendSlice(allocator, bytes[0..n]);
+    return true;
 }
 
 fn drawCommentEditor(
@@ -2955,7 +3020,7 @@ test "cancel selection mode clears selection state" {
     try std.testing.expectEqual(CopyNotice.none, state.copy_notice);
 }
 
-test "adding comment at cursor persists" {
+test "adding comment on selected row persists and marks line" {
     const allocator = std.testing.allocator;
     const patch =
         \\diff --git a/a.zig b/a.zig
@@ -3001,9 +3066,12 @@ test "adding comment at cursor persists" {
     };
     var view = try currentView(allocator, snapshot, &state);
     defer view.deinit(allocator);
+    var selected_line: ?*const diff.DiffLine = null;
     for (view.rows, 0..) |row, i| {
-        if (row.commentLine() != null) {
+        if (row.commentLine()) |line| {
             state.cursor_row = i;
+            state.selection_start = i;
+            selected_line = line;
             break;
         }
     } else return error.TestExpectedEqual;
@@ -3027,10 +3095,100 @@ test "adding comment at cursor persists" {
     try std.testing.expect(try addCommentAtCursor(allocator, snapshot, &store, &state, "persisted body", "tester"));
     try std.testing.expectEqual(@as(usize, 1), store.comments.len);
     try std.testing.expectEqualStrings("persisted body", store.comments[0].body);
+    try std.testing.expectEqual(@as(usize, 1), store.commentCount("a.zig", snapshot.review_target.target_id));
+    try std.testing.expect(lineHasComment(store, snapshot.files[0], selected_line orelse return error.TestExpectedEqual, snapshot.review_target.target_id));
 
     const comments_json = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, store.comments_path, allocator, .limited(1024 * 1024));
     defer allocator.free(comments_json);
     try std.testing.expect(std.mem.indexOf(u8, comments_json, "persisted body") != null);
+}
+
+test "adding comment over downward selection persists selected range" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1,4 @@
+        \\ one
+        \\+two
+        \\+three
+        \\+four
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 0,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = null,
+        .copy_notice = .none,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+    var view = try currentView(allocator, snapshot, &state);
+    defer view.deinit(allocator);
+    var start_row: ?usize = null;
+    var end_row: ?usize = null;
+    for (view.rows, 0..) |row, i| {
+        const line = row.commentLine() orelse continue;
+        if (util.eql(line.text, "two")) start_row = i;
+        if (util.eql(line.text, "four")) end_row = i;
+    }
+    state.selection_start = start_row orelse return error.TestExpectedEqual;
+    state.cursor_row = end_row orelse return error.TestExpectedEqual;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+    var store = store_mod.Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = try allocator.alloc(store_mod.Comment, 0),
+        .states = try allocator.alloc(store_mod.ReviewState, 0),
+    };
+    defer store.deinit();
+
+    try std.testing.expect(try addCommentAtCursor(allocator, snapshot, &store, &state, "range body", "tester"));
+    try std.testing.expectEqual(@as(usize, 1), store.comments.len);
+    try std.testing.expectEqual(@as(u32, 2), store.comments[0].start_line);
+    try std.testing.expectEqual(@as(u32, 4), store.comments[0].end_line);
+    try std.testing.expectEqual(@as(usize, 1), store.commentCount("a.zig", "target"));
+    try std.testing.expectEqual(@as(usize, 0), store.commentCount("a.zig", "other_target"));
+    for (view.rows) |row| {
+        const line = row.commentLine() orelse continue;
+        if (util.eql(line.text, "two") or util.eql(line.text, "three") or util.eql(line.text, "four")) {
+            try std.testing.expect(lineHasComment(store, snapshot.files[0], line, "target"));
+            try std.testing.expect(!lineHasComment(store, snapshot.files[0], line, "other_target"));
+        }
+    }
 }
 
 test "center cursor places target row at viewport midpoint" {
@@ -3478,14 +3636,17 @@ test "comment input treats delete escape as a delete byte" {
     try std.testing.expectEqual(@as(usize, 2), input.cursor);
 }
 
-test "comment input saves with ctrl-enter and cancels with escape" {
+test "comment input saves with ctrl-enter and buffers trailing escape" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
 
     try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, "body\x1b[13;5uignored"));
     try std.testing.expectEqualStrings("body", input.body.items);
-    try std.testing.expectEqual(.cancel, try handleCommentInputBytes(allocator, &input, "\x1b"));
+
+    const trailing = try handleCommentInputBytesPartial(allocator, &input, "\x1b");
+    try std.testing.expectEqual(CommentInputAction.incomplete_escape, trailing.action);
+    try std.testing.expectEqual(@as(usize, 0), trailing.consumed);
 }
 
 test "comment input accepts common ctrl-enter encodings" {
@@ -3511,10 +3672,15 @@ test "comment input buffers split ctrl-enter escape" {
     var input = CommentInput{};
     defer input.deinit(allocator);
 
+    const bare_escape = try handleCommentInputBytesPartial(allocator, &input, "body\x1b");
+    try std.testing.expectEqual(CommentInputAction.incomplete_escape, bare_escape.action);
+    try std.testing.expectEqual(@as(usize, 4), bare_escape.consumed);
+    try std.testing.expectEqualStrings("body", input.body.items);
+
     const first = try handleCommentInputBytesPartial(allocator, &input, "body\x1b[13;");
     try std.testing.expectEqual(CommentInputAction.incomplete_escape, first.action);
     try std.testing.expectEqual(@as(usize, 4), first.consumed);
-    try std.testing.expectEqualStrings("body", input.body.items);
+    try std.testing.expectEqualStrings("bodybody", input.body.items);
 
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(allocator);

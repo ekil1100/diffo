@@ -120,10 +120,10 @@ pub const Store = struct {
         try self.saveStates();
     }
 
-    pub fn commentCount(self: Store, file_path: []const u8) usize {
+    pub fn commentCount(self: Store, file_path: []const u8, target_id: []const u8) usize {
         var count: usize = 0;
         for (self.comments) |comment| {
-            if (util.eql(comment.file_path, file_path)) count += 1;
+            if (util.eql(comment.file_path, file_path) and util.eql(comment.review_target_id, target_id)) count += 1;
         }
         return count;
     }
@@ -239,6 +239,7 @@ pub const Store = struct {
 
     pub fn refreshMatchStatus(self: *Store, snapshot: diff.DiffSnapshot) void {
         for (self.comments) |*comment| {
+            if (!util.eql(comment.review_target_id, snapshot.review_target.target_id)) continue;
             var found_file = false;
             for (snapshot.files) |file| {
                 if (!util.eql(file.path, comment.file_path)) continue;
@@ -615,6 +616,67 @@ test "removing outdated comments respects target and file filter" {
     try std.testing.expect(hasComment(store, "cmt_missing_b"));
     try std.testing.expect(hasComment(store, "cmt_exact_a"));
     try std.testing.expect(hasComment(store, "cmt_other_target"));
+}
+
+test "comment count and match refresh respect review target" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+
+    var comments = try allocator.alloc(Comment, 2);
+    comments[0] = try testComment(allocator, "cmt_target_a", "target_a", "src/a.zig", .exact);
+    comments[1] = try testComment(allocator, "cmt_target_b", "target_b", "src/a.zig", .exact);
+
+    var store = Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = comments,
+        .states = try allocator.alloc(ReviewState, 0),
+    };
+    defer store.deinit();
+
+    var file = diff.DiffFile{
+        .path = try util.dupe(allocator, "src/a.zig"),
+        .old_path = null,
+        .status = .modified,
+        .source = .explicit,
+        .language = null,
+        .is_binary = false,
+        .hunks = try allocator.alloc(diff.DiffHunk, 0),
+        .patch_fingerprint = try util.dupe(allocator, "sha256:new"),
+        .patch_text = try util.dupe(allocator, ""),
+    };
+    defer file.deinit(allocator);
+    var files = [_]diff.DiffFile{file};
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target_a"),
+        },
+        .files = files[0..],
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), store.commentCount("src/a.zig", "target_a"));
+    try std.testing.expectEqual(@as(usize, 1), store.commentCount("src/a.zig", "target_b"));
+    try std.testing.expectEqual(@as(usize, 0), store.commentCount("src/a.zig", "target_c"));
+
+    store.refreshMatchStatus(snapshot);
+    try std.testing.expectEqual(MatchStatus.stale, store.comments[0].match_status);
+    try std.testing.expectEqual(MatchStatus.exact, store.comments[1].match_status);
 }
 
 test "removing all comments respects file filter across targets" {

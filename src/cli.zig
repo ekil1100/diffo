@@ -53,7 +53,7 @@ fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         var context = try loadDefaultContext(allocator, io, debug_git);
         defer context.deinit();
         context.store.refreshMatchStatus(context.snapshot);
-        if (json) try printCommentsJson(allocator, io, context.snapshot, context.store, file_filter) else try printCommentsText(allocator, io, context.store, file_filter);
+        if (json) try printCommentsJson(allocator, io, context.snapshot, context.store, file_filter) else try printCommentsText(allocator, io, context.snapshot.review_target.target_id, context.store, file_filter);
         return;
     }
     if (util.eql(args[0], "get")) {
@@ -64,6 +64,7 @@ fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         defer context.deinit();
         context.store.refreshMatchStatus(context.snapshot);
         for (context.store.comments) |comment| {
+            if (!util.eql(comment.review_target_id, context.snapshot.review_target.target_id)) continue;
             if (util.eql(comment.comment_id, id)) {
                 if (json) try printOneCommentJson(allocator, io, comment) else try printOneCommentText(allocator, io, comment);
                 return;
@@ -228,10 +229,11 @@ fn loadDefaultContext(allocator: std.mem.Allocator, io: std.Io, debug_git: bool)
     return .{ .snapshot = snapshot, .store = store };
 }
 
-fn printCommentsText(allocator: std.mem.Allocator, io: std.Io, store: store_mod.Store, file_filter: ?[]const u8) !void {
+fn printCommentsText(allocator: std.mem.Allocator, io: std.Io, target_id: []const u8, store: store_mod.Store, file_filter: ?[]const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     for (store.comments) |comment| {
+        if (!util.eql(comment.review_target_id, target_id)) continue;
         if (file_filter) |file| if (!util.eql(comment.file_path, file)) continue;
         const line = try std.fmt.allocPrint(allocator, "{s} {s}:{d}-{d} [{s}] {s}\n{s}\n", .{ comment.comment_id, comment.file_path, comment.start_line, comment.end_line, comment.match_status.label(), comment.author, comment.body });
         defer allocator.free(line);
@@ -257,6 +259,7 @@ fn printCommentsJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.Di
     try out.appendSlice(allocator, ",\n  \"comments\": [\n");
     var emitted: usize = 0;
     for (store.comments) |comment| {
+        if (!util.eql(comment.review_target_id, snapshot.review_target.target_id)) continue;
         if (file_filter) |file| if (!util.eql(comment.file_path, file)) continue;
         if (emitted > 0) try out.appendSlice(allocator, ",\n");
         try appendCommentJson(allocator, &out, comment, "    ");
@@ -346,7 +349,7 @@ fn printReviewText(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.Diff
     for (snapshot.files) |file| {
         if (file_filter) |filter| if (!util.eql(file.path, filter)) continue;
         const status = store.statusForFile(file.path, file.patch_fingerprint, snapshot.review_target.target_id);
-        const line = try std.fmt.allocPrint(allocator, "{s} {s} comments={d} fingerprint={s}\n", .{ status, file.path, store.commentCount(file.path), file.patch_fingerprint });
+        const line = try std.fmt.allocPrint(allocator, "{s} {s} comments={d} fingerprint={s}\n", .{ status, file.path, store.commentCount(file.path, snapshot.review_target.target_id), file.patch_fingerprint });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
     }
@@ -373,7 +376,7 @@ fn printReviewJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.Diff
         try out.appendSlice(allocator, ",\n      \"patch_fingerprint\": ");
         try util.writeJsonString(&out, allocator, file.patch_fingerprint);
         try out.appendSlice(allocator, ",\n      \"comment_count\": ");
-        const rendered = try std.fmt.allocPrint(allocator, "{d}\n    }}", .{store.commentCount(file.path)});
+        const rendered = try std.fmt.allocPrint(allocator, "{d}\n    }}", .{store.commentCount(file.path, snapshot.review_target.target_id)});
         defer allocator.free(rendered);
         try out.appendSlice(allocator, rendered);
         emitted += 1;
