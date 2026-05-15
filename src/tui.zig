@@ -44,6 +44,7 @@ const CopyNotice = union(enum) {
     copied: usize,
     empty,
     comment_added,
+    comment_not_added,
 };
 
 const Size = struct {
@@ -279,7 +280,7 @@ fn handleEvent(
                     };
                     defer if (body) |text| allocator.free(text);
                     if (body) |text| if (text.len > 0) {
-                        if (try addCommentAtCursor(allocator, snapshot.*, store, state, text, author)) state.copy_notice = .comment_added;
+                        state.copy_notice = if (try addCommentAtCursor(allocator, snapshot.*, store, state, text, author)) .comment_added else .comment_not_added;
                     };
                     state.selection_start = null;
                 },
@@ -387,6 +388,7 @@ fn render(
             .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s}/{s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .comment_not_added => try std.fmt.allocPrint(allocator, "no diff line in current file  mode={s}/{s} target={s} syntax={s}  c comment", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
         };
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
@@ -2056,16 +2058,44 @@ fn selectedCommentAnchor(file: diff.DiffFile, view: tui_view.FileView, state: *c
         last_line = line;
     }
 
-    const line = first_line orelse return null;
-    return .{
-        .line = line,
-        .hunk_header = first_hunk_header,
-        .end_line = if (last_line) |last| diffLineNumber(last) else 0,
-    };
+    if (first_line) |line| {
+        return .{
+            .line = line,
+            .hunk_header = first_hunk_header,
+            .end_line = if (last_line) |last| diffLineNumber(last) else 0,
+        };
+    }
+
+    return nearestCommentAnchor(file, view, cursor);
 }
 
 fn diffLineNumber(line: *const diff.DiffLine) u32 {
     return if (line.kind == .delete) (line.old_lineno orelse 0) else (line.new_lineno orelse line.old_lineno orelse 0);
+}
+
+fn nearestCommentAnchor(file: diff.DiffFile, view: tui_view.FileView, cursor: usize) ?CommentAnchor {
+    var distance: usize = 0;
+    while (distance < view.rows.len) : (distance += 1) {
+        const next = cursor + distance;
+        if (next < view.rows.len) {
+            if (commentAnchorForRow(file, view.rows[next])) |anchor| return anchor;
+        }
+
+        if (distance > 0 and cursor >= distance) {
+            if (commentAnchorForRow(file, view.rows[cursor - distance])) |anchor| return anchor;
+        }
+    }
+
+    return null;
+}
+
+fn commentAnchorForRow(file: diff.DiffFile, row: tui_view.VisualRow) ?CommentAnchor {
+    const line = row.commentLine() orelse return null;
+    return .{
+        .line = line,
+        .hunk_header = if (row.hunk_index) |idx| file.hunks[idx].header else "",
+        .end_line = diffLineNumber(line),
+    };
 }
 
 fn readEvent() ?Event {
@@ -2210,13 +2240,13 @@ const CommentInputResult = struct {
     consumed: usize,
 };
 
-const comment_save_sequences = [_][]const u8{
-    "\x1b[13;5u",
-    "\x1b[10;5u",
-    "\x1b[13;5~",
-    "\x1b[10;5~",
-    "\x1b[27;5;13~",
-    "\x1b[27;5;10~",
+const comment_newline_sequences = [_][]const u8{
+    "\x1b[13;2u",
+    "\x1b[10;2u",
+    "\x1b[13;2~",
+    "\x1b[10;2~",
+    "\x1b[27;2;13~",
+    "\x1b[27;2;10~",
 };
 
 const comment_navigation_sequences = [_][]const u8{
@@ -2242,7 +2272,11 @@ fn handleCommentInputBytesPartial(allocator: std.mem.Allocator, input: *CommentI
             4 => {},
             27 => {
                 const remaining = bytes[i..];
-                if (matchingEscapeSequence(remaining, comment_save_sequences[0..])) |len| return .{ .action = .save, .consumed = i + len };
+                if (commentNewlineSequenceLength(remaining)) |len| {
+                    try input.appendNewline(allocator);
+                    i += len;
+                    continue;
+                }
                 if (std.mem.startsWith(u8, bytes[i..], "\x1b[D")) {
                     input.moveLeft();
                     i += 3;
@@ -2268,24 +2302,24 @@ fn handleCommentInputBytesPartial(allocator: std.mem.Allocator, input: *CommentI
                     i += 4;
                     continue;
                 }
-                if (isEscapeSequencePrefix(remaining, comment_save_sequences[0..]) or
+                if (isEscapeSequencePrefix(remaining, comment_newline_sequences[0..]) or
                     isEscapeSequencePrefix(remaining, comment_navigation_sequences[0..]))
                 {
                     return .{ .action = .incomplete_escape, .consumed = i };
                 }
+                if (unknownEscapeSequenceLength(remaining)) |len| {
+                    i += len;
+                    continue;
+                }
+                if (isIncompleteTerminalSequence(remaining)) return .{ .action = .incomplete_escape, .consumed = i };
                 if (remaining.len == 1) return .{ .action = .incomplete_escape, .consumed = i };
                 return .{ .action = .cancel, .consumed = i + 1 };
             },
             '\r' => {
-                try input.appendNewline(allocator);
-                i += 1;
-                if (i < bytes.len and bytes[i] == '\n') i += 1;
-                continue;
+                return .{ .action = .save, .consumed = if (i + 1 < bytes.len and bytes[i + 1] == '\n') i + 2 else i + 1 };
             },
             '\n' => {
-                try input.appendNewline(allocator);
-                i += 1;
-                continue;
+                return .{ .action = .save, .consumed = i + 1 };
             },
             127, 8 => input.backspace(),
             '\t' => try input.appendByte(allocator, bytes[i]),
@@ -2313,11 +2347,73 @@ fn matchingEscapeSequence(bytes: []const u8, sequences: []const []const u8) ?usi
     return null;
 }
 
+fn commentNewlineSequenceLength(bytes: []const u8) ?usize {
+    if (matchingEscapeSequence(bytes, comment_newline_sequences[0..])) |len| return len;
+    return shiftEnterSequenceLength(bytes);
+}
+
+fn shiftEnterSequenceLength(bytes: []const u8) ?usize {
+    if (bytes.len < 3 or bytes[0] != 27 or bytes[1] != '[') return null;
+    var i: usize = 2;
+    while (i < bytes.len) : (i += 1) {
+        const byte = bytes[i];
+        if (byte >= 0x40 and byte <= 0x7e) {
+            if (byte != 'u' and byte != '~') return null;
+            return if (csiParamsContainShiftEnter(bytes[2..i])) i + 1 else null;
+        }
+    }
+    return null;
+}
+
+fn csiParamsContainShiftEnter(params: []const u8) bool {
+    var values = [_]u16{0} ** 6;
+    var value_count: usize = 0;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= params.len) : (index += 1) {
+        if (index == params.len or params[index] == ';' or params[index] == ':') {
+            if (index > start and value_count < values.len) {
+                values[value_count] = std.fmt.parseInt(u16, params[start..index], 10) catch 0;
+                value_count += 1;
+            }
+            start = index + 1;
+        }
+    }
+    if (value_count >= 2 and isEnterKey(values[0]) and modifierHasShift(values[1])) return true;
+    if (value_count >= 3 and values[0] == 27 and modifierHasShift(values[1]) and isEnterKey(values[2])) return true;
+    return false;
+}
+
+fn isEnterKey(value: u16) bool {
+    return value == 10 or value == 13;
+}
+
+fn modifierHasShift(value: u16) bool {
+    return value >= 1 and ((value - 1) & 1) != 0;
+}
+
 fn isEscapeSequencePrefix(bytes: []const u8, sequences: []const []const u8) bool {
     for (sequences) |sequence| {
         if (bytes.len < sequence.len and std.mem.startsWith(u8, sequence, bytes)) return true;
     }
     return false;
+}
+
+fn unknownEscapeSequenceLength(bytes: []const u8) ?usize {
+    if (bytes.len < 2 or bytes[0] != 27) return null;
+    const introducer = bytes[1];
+    if (introducer != '[' and introducer != 'O') return null;
+    var i: usize = 2;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] >= 0x40 and bytes[i] <= 0x7e) return i + 1;
+    }
+    return null;
+}
+
+fn isIncompleteTerminalSequence(bytes: []const u8) bool {
+    if (bytes.len < 2 or bytes[0] != 27) return false;
+    const introducer = bytes[1];
+    return introducer == '[' or introducer == 'O';
 }
 
 fn discardCommentInputPrefix(bytes: *std.ArrayList(u8), count: usize) void {
@@ -2417,7 +2513,7 @@ fn drawCommentEditor(
         try appendEditorLine(allocator, &out, layout, spacer, "", ansi, palette, false);
     }
 
-    try appendEditorLine(allocator, &out, layout, layout.height - 2, "Enter newline  Ctrl+Enter save  Esc cancel", ansi, palette, true);
+    try appendEditorLine(allocator, &out, layout, layout.height - 2, "Enter save  Shift+Enter newline  Esc cancel", ansi, palette, true);
     try appendStyledEditorLine(allocator, &out, layout.y + layout.height - 1, layout.x, try editorBorder(allocator, layout.width), layout.width, ansi, palette, false);
 
     const cursor_pos = commentCursorPosition(body, input.cursor, start, layout);
@@ -2463,8 +2559,8 @@ const CommentEditorLayout = struct {
             .height = height,
             .content_x = 3,
             .content_width = width - 5,
-            .body_y = 2,
-            .body_rows = height - 4,
+            .body_y = 1,
+            .body_rows = height - 3,
         };
     }
 };
@@ -3191,6 +3287,72 @@ test "adding comment over downward selection persists selected range" {
     }
 }
 
+test "adding comment from visual header anchors to nearest diff line" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old();
+        \\+new();
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state: State = .{
+        .active_file = 0,
+        .cursor_row = 0,
+        .scroll_row = 0,
+        .mode = .stacked,
+        .selection_start = null,
+        .copy_notice = .none,
+        .help = false,
+        .pending_g = false,
+        .folds = .empty,
+        .syntax_cache = undefined,
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+    var store = store_mod.Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = try allocator.alloc(store_mod.Comment, 0),
+        .states = try allocator.alloc(store_mod.ReviewState, 0),
+    };
+    defer store.deinit();
+
+    try std.testing.expect(try addCommentAtCursor(allocator, snapshot, &store, &state, "header body", "tester"));
+    try std.testing.expectEqual(@as(usize, 1), store.comments.len);
+    try std.testing.expectEqualStrings("header body", store.comments[0].body);
+    try std.testing.expectEqual(@as(u32, 1), store.comments[0].start_line);
+}
+
 test "center cursor places target row at viewport midpoint" {
     const rows = [_]tui_view.VisualRow{.{ .kind = .file_header }} ** 30;
     const changes = [_]tui_view.ChangeSpan{};
@@ -3613,15 +3775,18 @@ test "comment input preserves multiline body" {
     try std.testing.expectEqualStrings("first\nsecond", input.body.items);
 }
 
-test "comment input normalizes crlf and handles buffered backspace" {
+test "comment input saves with enter and handles buffered backspace" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
 
-    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "first\r\nsecond"));
-    try std.testing.expectEqualStrings("first\nsecond", input.body.items);
+    try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, "first\r\nsecond"));
+    try std.testing.expectEqualStrings("first", input.body.items);
+    input.body.clearRetainingCapacity();
+    input.cursor = 0;
+    try input.appendSlice(allocator, "second");
     try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x7f!"));
-    try std.testing.expectEqualStrings("first\nsecon!", input.body.items);
+    try std.testing.expectEqualStrings("secon!", input.body.items);
 }
 
 test "comment input treats delete escape as a delete byte" {
@@ -3636,38 +3801,53 @@ test "comment input treats delete escape as a delete byte" {
     try std.testing.expectEqual(@as(usize, 2), input.cursor);
 }
 
-test "comment input saves with ctrl-enter and buffers trailing escape" {
+test "comment input inserts newline with shift-enter and buffers trailing escape" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
 
-    try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, "body\x1b[13;5uignored"));
-    try std.testing.expectEqualStrings("body", input.body.items);
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "body\x1b[13;2uignored"));
+    try std.testing.expectEqualStrings("body\nignored", input.body.items);
 
     const trailing = try handleCommentInputBytesPartial(allocator, &input, "\x1b");
     try std.testing.expectEqual(CommentInputAction.incomplete_escape, trailing.action);
     try std.testing.expectEqual(@as(usize, 0), trailing.consumed);
 }
 
-test "comment input accepts common ctrl-enter encodings" {
+test "comment input accepts common shift-enter encodings" {
     const allocator = std.testing.allocator;
     const sequences = [_][]const u8{
-        "\x1b[13;5u",
-        "\x1b[10;5u",
-        "\x1b[13;5~",
-        "\x1b[10;5~",
-        "\x1b[27;5;13~",
-        "\x1b[27;5;10~",
+        "\x1b[13;2u",
+        "\x1b[10;2u",
+        "\x1b[13:2u",
+        "\x1b[13;2~",
+        "\x1b[10;2~",
+        "\x1b[27;2;13~",
+        "\x1b[27;2;10~",
     };
 
     for (sequences) |sequence| {
         var input = CommentInput{};
         defer input.deinit(allocator);
-        try std.testing.expectEqual(.save, try handleCommentInputBytes(allocator, &input, sequence));
+        try input.appendSlice(allocator, "body");
+        try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, sequence));
+        try std.testing.expectEqualStrings("body\n", input.body.items);
     }
 }
 
-test "comment input buffers split ctrl-enter escape" {
+test "comment input ignores non-newline terminal escapes" {
+    const allocator = std.testing.allocator;
+    var input = CommentInput{};
+    defer input.deinit(allocator);
+
+    try input.appendSlice(allocator, "body");
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[13~"));
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[13;5u"));
+    try std.testing.expectEqual(.continue_input, try handleCommentInputBytes(allocator, &input, "\x1b[5;13u"));
+    try std.testing.expectEqualStrings("body", input.body.items);
+}
+
+test "comment input buffers split shift-enter escape" {
     const allocator = std.testing.allocator;
     var input = CommentInput{};
     defer input.deinit(allocator);
@@ -3686,9 +3866,10 @@ test "comment input buffers split ctrl-enter escape" {
     defer pending.deinit(allocator);
     try pending.appendSlice(allocator, "body\x1b[13;");
     discardCommentInputPrefix(&pending, first.consumed);
-    try pending.appendSlice(allocator, "5u");
+    try pending.appendSlice(allocator, "2u");
     const second = try handleCommentInputBytesPartial(allocator, &input, pending.items);
-    try std.testing.expectEqual(CommentInputAction.save, second.action);
+    try std.testing.expectEqual(CommentInputAction.continue_input, second.action);
+    try std.testing.expectEqualStrings("bodybody\n", input.body.items);
 }
 
 test "comment input ignores ctrl-d as an editing byte" {
@@ -3753,8 +3934,8 @@ test "comment editor layout floats within terminal" {
     try std.testing.expectEqual(@as(usize, 14), layout.height);
     try std.testing.expectEqual(@as(usize, 3), layout.content_x);
     try std.testing.expectEqual(@as(usize, 79), layout.content_width);
-    try std.testing.expectEqual(@as(usize, 2), layout.body_y);
-    try std.testing.expectEqual(@as(usize, 10), layout.body_rows);
+    try std.testing.expectEqual(@as(usize, 1), layout.body_y);
+    try std.testing.expectEqual(@as(usize, 11), layout.body_rows);
 }
 
 test "comment cursor follows visible body tail" {
@@ -3769,17 +3950,17 @@ test "comment cursor follows visible body tail" {
         .height = 8,
         .content_x = 3,
         .content_width = 35,
-        .body_y = 2,
+        .body_y = 1,
         .body_rows = 4,
     };
 
     var pos = commentCursorPosition("", 0, 0, layout);
     try std.testing.expectEqual(@as(usize, 13), pos.x);
-    try std.testing.expectEqual(@as(usize, 6), pos.y);
+    try std.testing.expectEqual(@as(usize, 5), pos.y);
 
     pos = commentCursorPosition("one\n架", "one\n架".len, 0, layout);
     try std.testing.expectEqual(@as(usize, 15), pos.x);
-    try std.testing.expectEqual(@as(usize, 7), pos.y);
+    try std.testing.expectEqual(@as(usize, 6), pos.y);
 
     const body = "one\ntwo\nthree";
     const start = commentPreviewStartForCursor(body, body.len, 2);
@@ -3798,7 +3979,7 @@ test "comment cursor follows visible body tail" {
         .body_rows = 2,
     });
     try std.testing.expectEqual(@as(usize, 18), pos.x);
-    try std.testing.expectEqual(@as(usize, 7), pos.y);
+    try std.testing.expectEqual(@as(usize, 6), pos.y);
 }
 
 test "comment editor line keeps declared cell width with cjk text" {
