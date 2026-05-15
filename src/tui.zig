@@ -476,9 +476,99 @@ fn renderVisualRowLines(
         .fold => return oneRenderedLine(allocator, try renderFoldRow(allocator, row, width, selected, ansi, palette)),
         .stacked_code, .file_meta => {
             const line = row.line orelse return oneRenderedLine(allocator, try renderPanelRow(allocator, "", width, selected, ansi, palette));
-            return renderStackedCodeRows(allocator, state, file, file_index, store, target_id, line, width, line_width, selected, max_lines, ansi, palette);
+            const rows = try renderStackedCodeRows(allocator, state, file, file_index, store, target_id, line, width, line_width, selected, max_lines, ansi, palette);
+            return appendSelectedCommentRows(allocator, rows, selected, store, file, row, target_id, width, max_lines, ansi, palette);
         },
-        .split_code => return renderSplitCodeRows(allocator, state, file, file_index, store, target_id, row, width, line_width, selected, max_lines, ansi, palette),
+        .split_code => {
+            const rows = try renderSplitCodeRows(allocator, state, file, file_index, store, target_id, row, width, line_width, selected, max_lines, ansi, palette);
+            return appendSelectedCommentRows(allocator, rows, selected, store, file, row, target_id, width, max_lines, ansi, palette);
+        },
+    }
+}
+
+fn appendSelectedCommentRows(
+    allocator: std.mem.Allocator,
+    rows: [][]u8,
+    selected: bool,
+    store: store_mod.Store,
+    file: diff.DiffFile,
+    row: tui_view.VisualRow,
+    target_id: []const u8,
+    width: usize,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![][]u8 {
+    if (!selected or rows.len >= max_lines) return rows;
+    const comment_rows = try renderSelectedCommentRows(allocator, store, file, row, target_id, width, max_lines - rows.len, ansi, palette);
+    if (comment_rows.len == 0) {
+        allocator.free(comment_rows);
+        return rows;
+    }
+    errdefer {
+        for (rows) |line| allocator.free(line);
+        allocator.free(rows);
+        for (comment_rows) |line| allocator.free(line);
+        allocator.free(comment_rows);
+    }
+
+    const merged = try allocator.alloc([]u8, rows.len + comment_rows.len);
+    @memcpy(merged[0..rows.len], rows);
+    @memcpy(merged[rows.len..], comment_rows);
+    allocator.free(rows);
+    allocator.free(comment_rows);
+    return merged;
+}
+
+fn renderSelectedCommentRows(
+    allocator: std.mem.Allocator,
+    store: store_mod.Store,
+    file: diff.DiffFile,
+    row: tui_view.VisualRow,
+    target_id: []const u8,
+    width: usize,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) ![][]u8 {
+    var lines: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    for (store.comments) |comment| {
+        if (lines.items.len >= max_lines) break;
+        if (!rowHasComment(file, row, comment, target_id)) continue;
+        try appendCommentPreviewRows(allocator, &lines, comment, width, max_lines, ansi, palette);
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+fn appendCommentPreviewRows(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList([]u8),
+    comment: store_mod.Comment,
+    width: usize,
+    max_lines: usize,
+    ansi: theme.Ansi,
+    palette: theme.ThemeTokens,
+) !void {
+    var body_lines = std.mem.splitScalar(u8, comment.body, '\n');
+    var first = true;
+    while (lines.items.len < max_lines) {
+        const body_line = body_lines.next() orelse break;
+        const raw = if (first)
+            try std.fmt.allocPrint(allocator, "  ! {s} [{s}] {s}", .{ comment.author, comment.match_status.label(), body_line })
+        else
+            try std.fmt.allocPrint(allocator, "    {s}", .{body_line});
+        defer allocator.free(raw);
+        try lines.append(allocator, try styleCell(allocator, raw, width, ansi, palette.bg_panel, palette.comment_badge));
+        first = false;
+    }
+    if (first and lines.items.len < max_lines) {
+        const raw = try std.fmt.allocPrint(allocator, "  ! {s} [{s}]", .{ comment.author, comment.match_status.label() });
+        defer allocator.free(raw);
+        try lines.append(allocator, try styleCell(allocator, raw, width, ansi, palette.bg_panel, palette.comment_badge));
     }
 }
 
@@ -1085,6 +1175,24 @@ fn applyInlineRanges(
 }
 
 fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff.DiffLine, target_id: []const u8) bool {
+    for (store.comments) |comment| {
+        if (commentMatchesLine(comment, file, line, target_id)) return true;
+    }
+    return false;
+}
+
+fn rowHasComment(file: diff.DiffFile, row: tui_view.VisualRow, comment: store_mod.Comment, target_id: []const u8) bool {
+    if (row.line) |line| return commentMatchesLine(comment, file, line, target_id);
+    if (row.left) |line| {
+        if (commentMatchesLine(comment, file, line, target_id)) return true;
+    }
+    if (row.right) |line| {
+        if (commentMatchesLine(comment, file, line, target_id)) return true;
+    }
+    return false;
+}
+
+fn commentMatchesLine(comment: store_mod.Comment, file: diff.DiffFile, line: *const diff.DiffLine, target_id: []const u8) bool {
     const line_number = switch (line.kind) {
         .delete => line.old_lineno,
         .add => line.new_lineno,
@@ -1092,16 +1200,13 @@ fn lineHasComment(store: store_mod.Store, file: diff.DiffFile, line: *const diff
         .meta => null,
     } orelse return false;
     const side = if (line.kind == .delete) "old" else "new";
-    for (store.comments) |comment| {
-        if (!util.eql(comment.review_target_id, target_id)) continue;
-        if (!util.eql(comment.file_path, file.path)) continue;
-        const comment_end = if (comment.end_line == 0) comment.start_line else comment.end_line;
-        const start = @min(comment.start_line, comment_end);
-        const end = @max(comment.start_line, comment_end);
-        if (line_number < start or line_number > end) continue;
-        if (util.eql(comment.side, side) or line.kind == .context) return true;
-    }
-    return false;
+    if (!util.eql(comment.review_target_id, target_id)) return false;
+    if (!util.eql(comment.file_path, file.path)) return false;
+    const comment_end = if (comment.end_line == 0) comment.start_line else comment.end_line;
+    const start = @min(comment.start_line, comment_end);
+    const end = @max(comment.start_line, comment_end);
+    if (line_number < start or line_number > end) return false;
+    return util.eql(comment.side, side) or line.kind == .context;
 }
 
 fn rowFg(kind: diff.DiffLineKind, palette: theme.ThemeTokens) theme.Color {
@@ -3197,6 +3302,79 @@ test "adding comment on selected row persists and marks line" {
     const comments_json = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, store.comments_path, allocator, .limited(1024 * 1024));
     defer allocator.free(comments_json);
     try std.testing.expect(std.mem.indexOf(u8, comments_json, "persisted body") != null);
+}
+
+test "selected commented row renders previous comments" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-old();
+        \\+new();
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var state = State.init(allocator, std.testing.io, snapshot);
+    defer state.deinit(allocator);
+    var view = try currentView(allocator, snapshot, &state);
+    defer view.deinit(allocator);
+    for (view.rows, 0..) |row, i| {
+        const line = row.commentLine() orelse continue;
+        if (util.eql(line.text, "new();")) {
+            state.cursor_row = i;
+            break;
+        }
+    } else return error.TestExpectedEqual;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path_z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const tmp_path: []const u8 = tmp_path_z;
+    defer allocator.free(tmp_path_z);
+    var store = store_mod.Store{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .repo_dir = try util.dupe(allocator, tmp_path),
+        .comments_path = try std.fmt.allocPrint(allocator, "{s}/comments.json", .{tmp_path}),
+        .states_path = try std.fmt.allocPrint(allocator, "{s}/review-states.json", .{tmp_path}),
+        .comments = try allocator.alloc(store_mod.Comment, 0),
+        .states = try allocator.alloc(store_mod.ReviewState, 0),
+    };
+    defer store.deinit();
+
+    try std.testing.expect(try addCommentAtCursor(allocator, snapshot, &store, &state, "history body", "tester"));
+
+    const screen = try render(allocator, snapshot, store, &state, false);
+    defer allocator.free(screen);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "history body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "tester [exact]") != null);
+
+    state.cursor_row = 0;
+    const header_screen = try render(allocator, snapshot, store, &state, false);
+    defer allocator.free(header_screen);
+    try std.testing.expect(std.mem.indexOf(u8, header_screen, "history body") == null);
 }
 
 test "adding comment over downward selection persists selected range" {
