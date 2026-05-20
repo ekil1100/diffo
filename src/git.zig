@@ -344,8 +344,8 @@ pub fn loadFileSide(
     debug: bool,
 ) GitError!?[]u8 {
     if (file.is_binary) return null;
-    if (target.kind != .working_tree) return null;
     const runner = GitRunner{ .allocator = allocator, .io = io, .repo_root = repo.root_path, .debug = debug };
+    if (target.kind != .working_tree) return loadExplicitFileSide(allocator, io, runner, repo.root_path, target, file, side);
     return switch (file.source) {
         .unstaged => switch (side) {
             .old => try readIndexBlob(allocator, runner, file.old_path orelse file.path),
@@ -363,8 +363,131 @@ pub fn loadFileSide(
     };
 }
 
+fn loadExplicitFileSide(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runner: GitRunner,
+    repo_root: []const u8,
+    target: diff.ReviewTarget,
+    file: diff.DiffFile,
+    side: FileSide,
+) GitError!?[]u8 {
+    if (target.kind == .cached) {
+        return switch (side) {
+            .old => try readHeadBlob(allocator, runner, file.old_path orelse file.path),
+            .new => try readIndexBlob(allocator, runner, file.path),
+        };
+    }
+
+    var revs: std.ArrayList([]const u8) = .empty;
+    defer revs.deinit(allocator);
+    try collectRevisionArgs(allocator, runner, &revs, target.raw_args);
+
+    switch (target.kind) {
+        .commit => {
+            if (revs.items.len == 0) {
+                return switch (side) {
+                    .old => try readIndexBlob(allocator, runner, file.old_path orelse file.path),
+                    .new => try readWorktreeFile(allocator, io, repo_root, file.path),
+                };
+            }
+            if (revs.items.len == 1) {
+                return switch (side) {
+                    .old => try readBlobAtRevision(allocator, runner, revs.items[0], file.old_path orelse file.path),
+                    .new => try readWorktreeFile(allocator, io, repo_root, file.path),
+                };
+            }
+            if (revs.items.len >= 2) {
+                return switch (side) {
+                    .old => try readBlobAtRevision(allocator, runner, revs.items[0], file.old_path orelse file.path),
+                    .new => try readBlobAtRevision(allocator, runner, revs.items[1], file.path),
+                };
+            }
+        },
+        .range => if (rangeRevisions(target.raw_args)) |range| {
+            return switch (side) {
+                .old => try readBlobAtRevision(allocator, runner, revisionOrHead(range.old), file.old_path orelse file.path),
+                .new => try readBlobAtRevision(allocator, runner, revisionOrHead(range.new), file.path),
+            };
+        },
+        .symmetric_range => if (rangeRevisions(target.raw_args)) |range| {
+            switch (side) {
+                .old => {
+                    const base = try mergeBase(allocator, runner, revisionOrHead(range.old), revisionOrHead(range.new));
+                    defer allocator.free(base);
+                    return try readBlobAtRevision(allocator, runner, base, file.old_path orelse file.path);
+                },
+                .new => return try readBlobAtRevision(allocator, runner, revisionOrHead(range.new), file.path),
+            }
+        },
+        else => {},
+    }
+
+    return null;
+}
+
+fn collectRevisionArgs(allocator: std.mem.Allocator, runner: GitRunner, revs: *std.ArrayList([]const u8), args: []const []const u8) !void {
+    var before_pathspec = true;
+    for (args) |arg| {
+        if (util.eql(arg, "--")) {
+            before_pathspec = false;
+            continue;
+        }
+        if (!before_pathspec or util.startsWith(arg, "-")) continue;
+        if (util.contains(arg, "..")) continue;
+        if (!isRevision(runner, arg)) continue;
+        try revs.append(allocator, arg);
+    }
+}
+
+fn isRevision(runner: GitRunner, value: []const u8) bool {
+    const spec = std.fmt.allocPrint(runner.allocator, "{s}^{{commit}}", .{value}) catch return false;
+    defer runner.allocator.free(spec);
+
+    var result = runner.run(&.{ "rev-parse", "--verify", "--quiet", spec }) catch return false;
+    result.deinit(runner.allocator);
+    return true;
+}
+
+const RangeRevisions = struct {
+    old: []const u8,
+    new: []const u8,
+};
+
+fn rangeRevisions(args: []const []const u8) ?RangeRevisions {
+    for (args) |arg| {
+        if (std.mem.indexOf(u8, arg, "...")) |i| {
+            return .{ .old = arg[0..i], .new = arg[i + 3 ..] };
+        }
+        if (std.mem.indexOf(u8, arg, "..")) |i| {
+            return .{ .old = arg[0..i], .new = arg[i + 2 ..] };
+        }
+    }
+    return null;
+}
+
+fn revisionOrHead(rev: []const u8) []const u8 {
+    return if (rev.len == 0) "HEAD" else rev;
+}
+
+fn mergeBase(allocator: std.mem.Allocator, runner: GitRunner, old: []const u8, new: []const u8) GitError![]u8 {
+    const result = try runner.run(&.{ "merge-base", old, new });
+    allocator.free(result.stderr);
+    const trimmed = std.mem.trim(u8, result.stdout, "\r\n");
+    const base = try util.dupe(allocator, trimmed);
+    allocator.free(result.stdout);
+    return base;
+}
+
 fn readHeadBlob(allocator: std.mem.Allocator, runner: GitRunner, path: []const u8) GitError!?[]u8 {
     const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{path});
+    defer allocator.free(spec);
+    return readGitBlob(allocator, runner, spec);
+}
+
+fn readBlobAtRevision(allocator: std.mem.Allocator, runner: GitRunner, rev: []const u8, path: []const u8) GitError!?[]u8 {
+    if (rev.len == 0) return null;
+    const spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ rev, path });
     defer allocator.free(spec);
     return readGitBlob(allocator, runner, spec);
 }
@@ -392,4 +515,33 @@ fn readWorktreeFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const
         error.StreamTooLong, error.FileNotFound, error.AccessDenied => null,
         else => error.GitCommandFailed,
     };
+}
+
+test "collect revision args skips pathspecs and options" {
+    const allocator = std.testing.allocator;
+    const runner = GitRunner{ .allocator = allocator, .io = std.testing.io, .repo_root = ".", .debug = false };
+    var revs: std.ArrayList([]const u8) = .empty;
+    defer revs.deinit(allocator);
+
+    try collectRevisionArgs(allocator, runner, &revs, &.{ "--find-renames", "HEAD", "src/main.zig" });
+    try std.testing.expectEqual(@as(usize, 1), revs.items.len);
+    try std.testing.expectEqualStrings("HEAD", revs.items[0]);
+}
+
+test "range revisions split two-dot and three-dot specs" {
+    const range = rangeRevisions(&.{"main..feature"}).?;
+    try std.testing.expectEqualStrings("main", range.old);
+    try std.testing.expectEqualStrings("feature", range.new);
+
+    const symmetric = rangeRevisions(&.{"main...feature"}).?;
+    try std.testing.expectEqualStrings("main", symmetric.old);
+    try std.testing.expectEqualStrings("feature", symmetric.new);
+
+    const omitted_old = rangeRevisions(&.{"..feature"}).?;
+    try std.testing.expectEqualStrings("HEAD", revisionOrHead(omitted_old.old));
+    try std.testing.expectEqualStrings("feature", revisionOrHead(omitted_old.new));
+
+    const omitted_new = rangeRevisions(&.{"main..."}).?;
+    try std.testing.expectEqualStrings("main", revisionOrHead(omitted_new.old));
+    try std.testing.expectEqualStrings("HEAD", revisionOrHead(omitted_new.new));
 }

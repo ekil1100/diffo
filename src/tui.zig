@@ -409,8 +409,28 @@ fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot:
 }
 
 fn activeSyntaxMode(snapshot: diff.DiffSnapshot, file: diff.DiffFile) syntax.HighlightMode {
-    if (file.is_binary or snapshot.review_target.kind != .working_tree) return .disabled;
+    _ = snapshot;
+    if (file.is_binary) return .disabled;
     return syntax.modeForLanguage(file.language);
+}
+
+test "syntax mode follows language for explicit targets" {
+    const empty_hunks = [_]diff.DiffHunk{};
+    var file = diff.DiffFile{
+        .path = @constCast("src/main.zig"),
+        .old_path = null,
+        .status = .modified,
+        .source = .explicit,
+        .language = @constCast("zig"),
+        .is_binary = false,
+        .hunks = @constCast(empty_hunks[0..]),
+        .patch_fingerprint = @constCast("fingerprint"),
+        .patch_text = @constCast("patch"),
+    };
+    try std.testing.expectEqual(syntax.HighlightMode.tree_sitter, activeSyntaxMode(undefined, file));
+
+    file.is_binary = true;
+    try std.testing.expectEqual(syntax.HighlightMode.disabled, activeSyntaxMode(undefined, file));
 }
 
 fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {

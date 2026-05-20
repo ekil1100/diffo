@@ -282,7 +282,7 @@ Writes use a temporary file followed by rename, so interrupted writes should not
 
 ## Current V1 Limits
 
-- Tree-sitter highlighting is currently bundled for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, and Python files; unsupported languages, explicit targets, large files, and unavailable source sides are shown without syntax highlighting.
+- Tree-sitter highlighting is currently bundled for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, and Python files; unsupported languages, large files, and unavailable source sides are shown without syntax highlighting.
 - Comment relocation is minimal: comments become `stale` when the patch fingerprint changes.
 - Runtime theme switching and full config loading are not implemented yet.
 - Mouse support covers click selection and scroll wheel navigation; richer filtering/search can be added later.
