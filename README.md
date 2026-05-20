@@ -160,6 +160,8 @@ diffo comments list --file src/main.zig
 diffo comments list --json
 ```
 
+`comments list` 会显示当前仓库保存的评论，包括在 `diffo HEAD^` 这类显式 review target 中创建的评论。
+
 Get one comment:
 
 ```sh

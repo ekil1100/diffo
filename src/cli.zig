@@ -53,7 +53,7 @@ fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         var context = try loadDefaultContext(allocator, io, debug_git);
         defer context.deinit();
         context.store.refreshMatchStatus(context.snapshot);
-        if (json) try printCommentsJson(allocator, io, context.snapshot, context.store, file_filter) else try printCommentsText(allocator, io, context.snapshot.review_target.target_id, context.store, file_filter);
+        if (json) try printCommentsJson(allocator, io, context.snapshot, context.store, null, file_filter) else try printCommentsText(allocator, io, null, context.store, file_filter);
         return;
     }
     if (util.eql(args[0], "get")) {
@@ -64,7 +64,6 @@ fn commentsCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         defer context.deinit();
         context.store.refreshMatchStatus(context.snapshot);
         for (context.store.comments) |comment| {
-            if (!util.eql(comment.review_target_id, context.snapshot.review_target.target_id)) continue;
             if (util.eql(comment.comment_id, id)) {
                 if (json) try printOneCommentJson(allocator, io, comment) else try printOneCommentText(allocator, io, comment);
                 return;
@@ -229,12 +228,11 @@ fn loadDefaultContext(allocator: std.mem.Allocator, io: std.Io, debug_git: bool)
     return .{ .snapshot = snapshot, .store = store };
 }
 
-fn printCommentsText(allocator: std.mem.Allocator, io: std.Io, target_id: []const u8, store: store_mod.Store, file_filter: ?[]const u8) !void {
+fn printCommentsText(allocator: std.mem.Allocator, io: std.Io, target_filter: ?[]const u8, store: store_mod.Store, file_filter: ?[]const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     for (store.comments) |comment| {
-        if (!util.eql(comment.review_target_id, target_id)) continue;
-        if (file_filter) |file| if (!util.eql(comment.file_path, file)) continue;
+        if (!commentMatchesFilters(comment, target_filter, file_filter)) continue;
         const line = try std.fmt.allocPrint(allocator, "{s} {s}:{d}-{d} [{s}] {s}\n{s}\n", .{ comment.comment_id, comment.file_path, comment.start_line, comment.end_line, comment.match_status.label(), comment.author, comment.body });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
@@ -249,18 +247,17 @@ fn printOneCommentText(allocator: std.mem.Allocator, io: std.Io, comment: store_
     try writeAll(io, line);
 }
 
-fn printCommentsJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.DiffSnapshot, store: store_mod.Store, file_filter: ?[]const u8) !void {
+fn printCommentsJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.DiffSnapshot, store: store_mod.Store, target_filter: ?[]const u8, file_filter: ?[]const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "{\n  \"schema_version\": 1,\n  \"repository_id\": ");
     try util.writeJsonString(&out, allocator, snapshot.repository.repo_id);
     try out.appendSlice(allocator, ",\n  \"review_target_id\": ");
-    try util.writeJsonString(&out, allocator, snapshot.review_target.target_id);
+    try appendOptionalJsonString(allocator, &out, target_filter);
     try out.appendSlice(allocator, ",\n  \"comments\": [\n");
     var emitted: usize = 0;
     for (store.comments) |comment| {
-        if (!util.eql(comment.review_target_id, snapshot.review_target.target_id)) continue;
-        if (file_filter) |file| if (!util.eql(comment.file_path, file)) continue;
+        if (!commentMatchesFilters(comment, target_filter, file_filter)) continue;
         if (emitted > 0) try out.appendSlice(allocator, ",\n");
         try appendCommentJson(allocator, &out, comment, "    ");
         emitted += 1;
@@ -343,6 +340,12 @@ fn appendCommentJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), comm
     try out.append(allocator, '}');
 }
 
+fn commentMatchesFilters(comment: store_mod.Comment, target_filter: ?[]const u8, file_filter: ?[]const u8) bool {
+    if (target_filter) |target_id| if (!util.eql(comment.review_target_id, target_id)) return false;
+    if (file_filter) |file| if (!util.eql(comment.file_path, file)) return false;
+    return true;
+}
+
 fn printReviewText(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.DiffSnapshot, store: store_mod.Store, file_filter: ?[]const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -401,6 +404,14 @@ fn intField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), indent: []con
     try out.appendSlice(allocator, line);
 }
 
+fn appendOptionalJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: ?[]const u8) !void {
+    if (value) |text| {
+        try util.writeJsonString(out, allocator, text);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+}
+
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
     for (args) |arg| if (util.eql(arg, flag)) return true;
     return false;
@@ -453,3 +464,50 @@ const helpText =
     \\  j/k line, J/K file, n/N change, C unfold/fold mode, z/Z folds, v stacked/split, r reviewed, c comment, V select, y copy, Esc clear selection, u unreviewed, ? help, q quit
     \\
 ;
+
+test "comment list filters can include comments from any target" {
+    const target_a = testCliComment("cmt_a", "target_a", "src/a.zig");
+    const target_b = testCliComment("cmt_b", "target_b", "src/b.zig");
+
+    try std.testing.expect(commentMatchesFilters(target_a, null, null));
+    try std.testing.expect(commentMatchesFilters(target_b, null, null));
+    try std.testing.expect(commentMatchesFilters(target_a, null, "src/a.zig"));
+    try std.testing.expect(!commentMatchesFilters(target_b, null, "src/a.zig"));
+    try std.testing.expect(commentMatchesFilters(target_a, "target_a", null));
+    try std.testing.expect(!commentMatchesFilters(target_b, "target_a", null));
+}
+
+test "comment list json target field supports repository scope" {
+    const allocator = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try appendOptionalJsonString(allocator, &out, null);
+    try std.testing.expectEqualStrings("null", out.items);
+
+    out.clearRetainingCapacity();
+    try appendOptionalJsonString(allocator, &out, "target_a");
+    try std.testing.expectEqualStrings("\"target_a\"", out.items);
+}
+
+fn testCliComment(id: []const u8, target_id: []const u8, file_path: []const u8) store_mod.Comment {
+    return .{
+        .comment_id = @constCast(id),
+        .repository_id = @constCast("repo_test"),
+        .review_target_id = @constCast(target_id),
+        .file_path = @constCast(file_path),
+        .side = @constCast("new"),
+        .start_line = 1,
+        .end_line = 1,
+        .stable_line_id = @constCast("line_test"),
+        .hunk_header = @constCast("@@ -1 +1 @@"),
+        .context_before = @constCast(""),
+        .context_after = @constCast(""),
+        .patch_fingerprint = @constCast("sha256:test"),
+        .match_status = .exact,
+        .body = @constCast("body"),
+        .author = @constCast("tester"),
+        .created_at = @constCast("2026-01-01T00:00:00Z"),
+        .updated_at = @constCast("2026-01-01T00:00:00Z"),
+    };
+}
