@@ -2612,7 +2612,7 @@ fn drawCommentEditor(
 ) !void {
     const layout = CommentEditorLayout.init(terminalSize());
     const body = input.body.items;
-    const start = commentPreviewStartForCursor(body, input.cursor, layout.body_rows);
+    const start = commentPreviewStartForCursor(body, input.cursor, layout.body_rows, layout.content_width);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -2623,11 +2623,9 @@ fn drawCommentEditor(
     var cursor = start;
     while (rendered < layout.body_rows) : (rendered += 1) {
         if (cursor < body.len) {
-            const remaining = body[cursor..];
-            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-            try appendEditorLine(allocator, &out, layout, layout.body_y + rendered, remaining[0..line_end], ansi, palette, false);
-            cursor += line_end;
-            if (cursor < body.len and body[cursor] == '\n') cursor += 1;
+            const visual_line = nextCommentVisualLine(body, cursor, layout.content_width);
+            try appendEditorLine(allocator, &out, layout, layout.body_y + rendered, body[visual_line.start..visual_line.end], ansi, palette, false);
+            cursor = visual_line.next;
         } else {
             try appendEditorLine(allocator, &out, layout, layout.body_y + rendered, "", ansi, palette, false);
         }
@@ -2695,6 +2693,12 @@ const CommentCursorPosition = struct {
     y: usize,
 };
 
+const CommentVisualLine = struct {
+    start: usize,
+    end: usize,
+    next: usize,
+};
+
 const VerticalDirection = enum {
     up,
     down,
@@ -2726,6 +2730,35 @@ fn lineEndAfter(bytes: []const u8, cursor: usize) usize {
     var i = @min(cursor, bytes.len);
     while (i < bytes.len and bytes[i] != '\n') : (i += 1) {}
     return i;
+}
+
+fn nextCommentVisualLine(body: []const u8, start: usize, wrap_width: usize) CommentVisualLine {
+    const line_start = @min(start, body.len);
+    if (line_start >= body.len) return .{ .start = line_start, .end = line_start, .next = line_start };
+    if (body[line_start] == '\n') return .{ .start = line_start, .end = line_start, .next = line_start + 1 };
+
+    const max_width = @max(wrap_width, @as(usize, 1));
+    const hard_end = lineEndAfter(body, line_start);
+    var visible: usize = 0;
+    var i = line_start;
+    while (i < hard_end) {
+        const seq_len = tui_text.utf8SeqLen(body[i]);
+        if (i + seq_len > hard_end) {
+            if (i == line_start) i += 1;
+            break;
+        }
+        const char_width = tui_text.displayWidth(body[i .. i + seq_len]);
+        if (visible > 0 and visible + char_width > max_width) break;
+        i += seq_len;
+        visible += char_width;
+        if (visible > max_width) break;
+    }
+
+    return .{
+        .start = line_start,
+        .end = i,
+        .next = if (i < body.len and body[i] == '\n') i + 1 else i,
+    };
 }
 
 fn displayWidthRange(bytes: []const u8, start: usize, end: usize) usize {
@@ -2776,24 +2809,35 @@ fn verticalCursorMove(bytes: []const u8, cursor: usize, direction: VerticalDirec
 }
 
 fn commentCursorPosition(body: []const u8, cursor: usize, start: usize, layout: CommentEditorLayout) CommentCursorPosition {
+    if (layout.body_rows == 0) return .{ .x = layout.x + layout.content_x, .y = layout.y + layout.body_y };
+
+    const target = @min(cursor, body.len);
     var row: usize = 0;
-    var line_start = start;
-    var i = start;
-    while (i < cursor and i < body.len) : (i += 1) {
-        if (body[i] == '\n') {
-            if (row + 1 < layout.body_rows) {
-                row += 1;
-                line_start = i + 1;
-            }
+    var visual_start = start;
+    while (visual_start < body.len and row < layout.body_rows) {
+        const visual_line = nextCommentVisualLine(body, visual_start, layout.content_width);
+        if (target < visual_line.start or commentCursorInVisualLine(target, visual_line)) {
+            const cursor_end = if (target < visual_line.start) visual_line.start else @min(target, visual_line.end);
+            const visible_width = displayWidthRange(body, visual_line.start, cursor_end);
+            return .{
+                .x = layout.x + layout.content_x + @min(layout.content_width, visible_width),
+                .y = layout.y + layout.body_y + row,
+            };
         }
+        visual_start = visual_line.next;
+        row += 1;
     }
 
-    const visible_width = displayWidthRange(body, line_start, @min(cursor, body.len));
-
     return .{
-        .x = layout.x + layout.content_x + @min(layout.content_width, visible_width),
+        .x = layout.x + layout.content_x,
         .y = layout.y + layout.body_y + @min(row, layout.body_rows - 1),
     };
+}
+
+fn commentCursorInVisualLine(cursor: usize, visual_line: CommentVisualLine) bool {
+    if (cursor < visual_line.start) return false;
+    if (visual_line.next > visual_line.end and cursor == visual_line.next) return false;
+    return cursor <= visual_line.end;
 }
 
 fn appendCursorMove(allocator: std.mem.Allocator, out: *std.ArrayList(u8), y: usize, x: usize) !void {
@@ -2890,18 +2934,33 @@ fn commentPreviewStart(body: []const u8, max_rows: usize) usize {
     return 0;
 }
 
-fn commentPreviewStartForCursor(body: []const u8, cursor: usize, max_rows: usize) usize {
+fn commentPreviewStartForCursor(body: []const u8, cursor: usize, max_rows: usize, wrap_width: usize) usize {
     if (body.len == 0 or max_rows == 0) return 0;
-    var rows: usize = 1;
-    var i = @min(cursor, body.len);
-    while (i > 0) {
-        i -= 1;
-        if (body[i] == '\n') {
-            if (rows == max_rows) return i + 1;
-            rows += 1;
-        }
+    const cursor_row = commentCursorVisualRow(body, cursor, wrap_width);
+    const first_row = if (cursor_row + 1 > max_rows) cursor_row + 1 - max_rows else 0;
+    return commentVisualLineStartAtRow(body, first_row, wrap_width);
+}
+
+fn commentCursorVisualRow(body: []const u8, cursor: usize, wrap_width: usize) usize {
+    const target = @min(cursor, body.len);
+    var row: usize = 0;
+    var start: usize = 0;
+    while (start < body.len) {
+        const visual_line = nextCommentVisualLine(body, start, wrap_width);
+        if (commentCursorInVisualLine(target, visual_line)) return row;
+        start = visual_line.next;
+        row += 1;
     }
-    return 0;
+    return row;
+}
+
+fn commentVisualLineStartAtRow(body: []const u8, row: usize, wrap_width: usize) usize {
+    var index: usize = 0;
+    var start: usize = 0;
+    while (index < row and start < body.len) : (index += 1) {
+        start = nextCommentVisualLine(body, start, wrap_width).next;
+    }
+    return start;
 }
 
 fn writeAll(io: std.Io, bytes: []const u8) !void {
@@ -4161,7 +4220,7 @@ test "comment cursor follows visible body tail" {
     try std.testing.expectEqual(@as(usize, 6), pos.y);
 
     const body = "one\ntwo\nthree";
-    const start = commentPreviewStartForCursor(body, body.len, 2);
+    const start = commentPreviewStartForCursor(body, body.len, 2, layout.content_width);
     pos = commentCursorPosition(body, body.len, start, .{
         .panel_x = layout.panel_x,
         .panel_y = layout.panel_y,
@@ -4178,6 +4237,56 @@ test "comment cursor follows visible body tail" {
     });
     try std.testing.expectEqual(@as(usize, 18), pos.x);
     try std.testing.expectEqual(@as(usize, 6), pos.y);
+}
+
+test "comment editor wraps long visual lines" {
+    var visual_line = nextCommentVisualLine("abcdefghi", 0, 4);
+    try std.testing.expectEqual(@as(usize, 0), visual_line.start);
+    try std.testing.expectEqual(@as(usize, 4), visual_line.end);
+    try std.testing.expectEqual(@as(usize, 4), visual_line.next);
+
+    visual_line = nextCommentVisualLine("abcdefghi", visual_line.next, 4);
+    try std.testing.expectEqual(@as(usize, 4), visual_line.start);
+    try std.testing.expectEqual(@as(usize, 8), visual_line.end);
+    try std.testing.expectEqual(@as(usize, 8), visual_line.next);
+
+    visual_line = nextCommentVisualLine("ab\ncd", 0, 4);
+    try std.testing.expectEqual(@as(usize, 0), visual_line.start);
+    try std.testing.expectEqual(@as(usize, 2), visual_line.end);
+    try std.testing.expectEqual(@as(usize, 3), visual_line.next);
+}
+
+test "comment cursor and preview follow wrapped rows" {
+    const layout: CommentEditorLayout = .{
+        .panel_x = 8,
+        .panel_y = 3,
+        .panel_width = 12,
+        .panel_height = 6,
+        .x = 10,
+        .y = 4,
+        .width = 10,
+        .height = 5,
+        .content_x = 3,
+        .content_width = 4,
+        .body_y = 1,
+        .body_rows = 2,
+    };
+    const body = "abcdefghi";
+    const start = commentPreviewStartForCursor(body, body.len, layout.body_rows, layout.content_width);
+    try std.testing.expectEqual(@as(usize, 4), start);
+
+    const pos = commentCursorPosition(body, body.len, start, layout);
+    try std.testing.expectEqual(@as(usize, 14), pos.x);
+    try std.testing.expectEqual(@as(usize, 6), pos.y);
+}
+
+test "comment editor wraps cjk by cell width" {
+    var visual_line = nextCommentVisualLine("架abc", 0, 3);
+    try std.testing.expectEqualStrings("架a", "架abc"[visual_line.start..visual_line.end]);
+    try std.testing.expectEqual(@as(usize, 4), visual_line.next);
+
+    visual_line = nextCommentVisualLine("架abc", visual_line.next, 3);
+    try std.testing.expectEqualStrings("bc", "架abc"[visual_line.start..visual_line.end]);
 }
 
 test "comment editor line keeps declared cell width with cjk text" {
