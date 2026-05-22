@@ -129,9 +129,13 @@ pub fn buildFileView(
         if (hunk.lines.len == 0) {
             try rows.append(allocator, .{ .kind = .hunk_header, .hunk_index = hunk_index, .hunk_header = hunk.header });
         }
+        const context_visibility = try buildContextVisibility(allocator, hunk, fold_mode);
+        defer {
+            if (context_visibility) |visible| allocator.free(visible);
+        }
         switch (mode) {
-            .stacked => try appendStackedHunk(allocator, &rows, hunk, file_index, hunk_index, fold_mode, folds),
-            .split => try appendSplitHunk(allocator, &rows, hunk, file_index, hunk_index, fold_mode, folds),
+            .stacked => try appendStackedHunk(allocator, &rows, hunk, file_index, hunk_index, fold_mode, folds, context_visibility),
+            .split => try appendSplitHunk(allocator, &rows, hunk, file_index, hunk_index, fold_mode, folds, context_visibility),
         }
     }
 
@@ -155,13 +159,14 @@ fn appendStackedHunk(
     hunk_index: usize,
     fold_mode: FoldMode,
     folds: []const FoldEntry,
+    context_visibility: ?[]const bool,
 ) !void {
     var i: usize = 0;
     var fold_ordinal: usize = 0;
     while (i < hunk.lines.len) {
-        if (hunk.lines[i].kind == .context and !contextVisible(hunk.*, i)) {
+        if (hunk.lines[i].kind == .context and !contextVisible(hunk, context_visibility, i)) {
             const start = i;
-            while (i < hunk.lines.len and hunk.lines[i].kind == .context and !contextVisible(hunk.*, i)) : (i += 1) {}
+            while (i < hunk.lines.len and hunk.lines[i].kind == .context and !contextVisible(hunk, context_visibility, i)) : (i += 1) {}
             try appendContextRun(allocator, rows, hunk, file_index, hunk_index, fold_ordinal, start, i, fold_mode, folds, .stacked);
             fold_ordinal += 1;
             continue;
@@ -183,14 +188,15 @@ fn appendSplitHunk(
     hunk_index: usize,
     fold_mode: FoldMode,
     folds: []const FoldEntry,
+    context_visibility: ?[]const bool,
 ) !void {
     var i: usize = 0;
     var fold_ordinal: usize = 0;
     while (i < hunk.lines.len) {
         if (hunk.lines[i].kind == .context) {
-            if (!contextVisible(hunk.*, i)) {
+            if (!contextVisible(hunk, context_visibility, i)) {
                 const start = i;
-                while (i < hunk.lines.len and hunk.lines[i].kind == .context and !contextVisible(hunk.*, i)) : (i += 1) {}
+                while (i < hunk.lines.len and hunk.lines[i].kind == .context and !contextVisible(hunk, context_visibility, i)) : (i += 1) {}
                 try appendContextRun(allocator, rows, hunk, file_index, hunk_index, fold_ordinal, start, i, fold_mode, folds, .split);
                 fold_ordinal += 1;
             } else {
@@ -302,18 +308,40 @@ fn appendContextRow(
     }
 }
 
-fn contextVisible(hunk: diff.DiffHunk, index: usize) bool {
-    if (hunk.lines[index].kind != .context) return true;
+fn buildContextVisibility(allocator: std.mem.Allocator, hunk: *const diff.DiffHunk, fold_mode: FoldMode) !?[]bool {
+    if (fold_mode == .unfold) return null;
+
+    var has_context = false;
     var saw_change = false;
-    var nearest: usize = std.math.maxInt(usize);
-    for (hunk.lines, 0..) |line, i| {
-        if (line.kind == .add or line.kind == .delete) {
-            saw_change = true;
-            const distance = if (i > index) i - index else index - i;
-            nearest = @min(nearest, distance);
+    for (hunk.lines) |line| {
+        switch (line.kind) {
+            .context => has_context = true,
+            .add, .delete => saw_change = true,
+            .meta => {},
         }
     }
-    return !saw_change or nearest <= context_radius;
+    if (!has_context or !saw_change) return null;
+
+    const visible = try allocator.alloc(bool, hunk.lines.len);
+    @memset(visible, false);
+
+    for (hunk.lines, 0..) |line, i| {
+        if (line.kind == .add or line.kind == .delete) {
+            const start = if (i > context_radius) i - context_radius else 0;
+            const end = @min(hunk.lines.len, i + context_radius + 1);
+            for (start..end) |idx| {
+                if (hunk.lines[idx].kind == .context) visible[idx] = true;
+            }
+        }
+    }
+
+    return visible;
+}
+
+fn contextVisible(hunk: *const diff.DiffHunk, visibility: ?[]const bool, index: usize) bool {
+    if (hunk.lines[index].kind != .context) return true;
+    const visible = visibility orelse return true;
+    return visible[index];
 }
 
 pub fn foldState(folds: []const FoldEntry, id: FoldId) FoldState {
@@ -362,6 +390,7 @@ pub fn nextChange(view: FileView, cursor_row: usize) ?usize {
 pub fn previousChange(view: FileView, cursor_row: usize) ?usize {
     var found: ?usize = null;
     for (view.changes) |change| {
+        if (change.start_row >= cursor_row) break;
         if (change.start_row < cursor_row) found = change.start_row;
     }
     return found;
@@ -415,6 +444,143 @@ test "unfold mode shows long context without fold row" {
     }
     try std.testing.expectEqual(@as(usize, 0), fold_count);
     try std.testing.expect(visible_context);
+}
+
+test "fold mode folds distant context and keeps nearby context visible" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,18 +1,18 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\ five
+        \\ six
+        \\ six-a
+        \\ six-b
+        \\ six-c
+        \\ six-d
+        \\-old();
+        \\+new();
+        \\ seven
+        \\ eight
+        \\ nine
+        \\ ten
+        \\ eleven
+        \\ twelve
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    var view = try buildFileView(allocator, &files[0], 0, .stacked, .fold, &.{});
+    defer view.deinit(allocator);
+
+    var fold_count: usize = 0;
+    var nearby_context_visible = false;
+    for (view.rows) |row| {
+        if (row.kind == .fold) fold_count += 1;
+        if (row.kind == .stacked_code and row.fold_id == null) {
+            if (row.line) |line| {
+                if (line.kind == .context and std.mem.eql(u8, line.text, "six-b")) nearby_context_visible = true;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), fold_count);
+    try std.testing.expect(nearby_context_visible);
+}
+
+test "split fold mode folds distant context and keeps nearby context visible" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,18 +1,18 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\ five
+        \\ six
+        \\ six-a
+        \\ six-b
+        \\ six-c
+        \\ six-d
+        \\-old();
+        \\+new();
+        \\ seven
+        \\ eight
+        \\ nine
+        \\ ten
+        \\ eleven
+        \\ twelve
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    var view = try buildFileView(allocator, &files[0], 0, .split, .fold, &.{});
+    defer view.deinit(allocator);
+
+    var fold_count: usize = 0;
+    var nearby_context_visible = false;
+    for (view.rows) |row| {
+        if (row.kind == .fold) fold_count += 1;
+        if (row.kind == .split_code and row.fold_id == null) {
+            if (row.left) |line| {
+                if (line.kind == .context and std.mem.eql(u8, line.text, "six-b")) nearby_context_visible = true;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), fold_count);
+    try std.testing.expect(nearby_context_visible);
+}
+
+test "fold mode keeps context visible when hunk has no changes" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,5 +1,5 @@
+        \\ one
+        \\ two
+        \\ three
+        \\ four
+        \\ five
+        \\
+    ;
+    const files = try diff.parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    var view = try buildFileView(allocator, &files[0], 0, .stacked, .fold, &.{});
+    defer view.deinit(allocator);
+
+    var fold_count: usize = 0;
+    var context_count: usize = 0;
+    for (view.rows) |row| {
+        if (row.kind == .fold) fold_count += 1;
+        if (row.kind == .stacked_code) {
+            if (row.line) |line| {
+                if (line.kind == .context) context_count += 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), fold_count);
+    try std.testing.expectEqual(@as(usize, 5), context_count);
 }
 
 test "split view pairs delete and add rows" {
