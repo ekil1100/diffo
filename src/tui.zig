@@ -1596,11 +1596,6 @@ fn ensureCursorVisibleInLayout(
     if (fill_bottom) try fillViewportAtBottom(allocator, snapshot, state, view, layout);
 }
 
-fn centerCursorInViewport(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) !void {
-    const layout = Layout.init(terminalSize());
-    try centerCursorInLayout(allocator, snapshot, view, state, layout);
-}
-
 fn centerCursorInLayout(
     allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
@@ -2018,16 +2013,16 @@ fn jumpToFirstChangeInCurrentFileInLayout(allocator: std.mem.Allocator, snapshot
 }
 
 fn jumpChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
+    try jumpChangeInLayout(allocator, snapshot, state, delta, Layout.init(terminalSize()));
+}
+
+fn jumpChangeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize, layout: Layout) !void {
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
     const next = if (delta > 0) tui_view.nextChange(view, state.cursor_row) else tui_view.previousChange(view, state.cursor_row);
     if (next) |row| {
         state.cursor_row = row;
-        if (delta > 0) {
-            try centerCursorInViewport(allocator, snapshot, view, state);
-        } else {
-            try ensureCursorVisible(allocator, snapshot, view, state);
-        }
+        try centerCursorInLayout(allocator, snapshot, view, state, layout);
     }
 }
 
@@ -3952,6 +3947,71 @@ test "initial cursor jumps to first change" {
     const line = view.rows[state.cursor_row].line orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(diff.DiffLineKind.delete, line.kind);
     try std.testing.expectEqualStrings("old();", line.text);
+}
+
+test "change jumps center cursor in both directions" {
+    const allocator = std.testing.allocator;
+    var patch: std.ArrayList(u8) = .empty;
+    defer patch.deinit(allocator);
+    try patch.appendSlice(allocator,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,40 +1,40 @@
+        \\
+    );
+    for (1..41) |line_no| {
+        if (line_no == 8 or line_no == 20 or line_no == 32) {
+            const changed = try std.fmt.allocPrint(allocator, "-old_{d}();\n+new_{d}();\n", .{ line_no, line_no });
+            defer allocator.free(changed);
+            try patch.appendSlice(allocator, changed);
+        } else {
+            const context = try std.fmt.allocPrint(allocator, " context_{d}();\n", .{line_no});
+            defer allocator.free(context);
+            try patch.appendSlice(allocator, context);
+        }
+    }
+    const files = try diff.parsePatch(allocator, patch.items, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    const snapshot: diff.DiffSnapshot = .{
+        .snapshot_id = @constCast("snapshot"),
+        .repository = .{
+            .root_path = @constCast("/tmp/repo"),
+            .repo_id = @constCast("repo"),
+            .current_branch = @constCast("main"),
+        },
+        .review_target = .{
+            .kind = .working_tree,
+            .raw_args = &.{},
+            .normalized_spec = @constCast("working tree"),
+            .target_id = @constCast("target"),
+        },
+        .files = files,
+    };
+    var view_state: State = .{ .syntax_cache = undefined };
+    defer view_state.folds.deinit(allocator);
+    var view = try currentView(allocator, snapshot, &view_state);
+    defer view.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), view.changes.len);
+
+    const layout = Layout.init(.{ .width = 80, .height = 12 });
+    const middle_change = view.changes[1].start_row;
+    const expected_scroll = middle_change - (layout.body_height / 2);
+
+    var next_state: State = .{ .cursor_row = view.changes[0].start_row, .syntax_cache = undefined };
+    defer next_state.folds.deinit(allocator);
+    try jumpChangeInLayout(allocator, snapshot, &next_state, 1, layout);
+    try std.testing.expectEqual(middle_change, next_state.cursor_row);
+    try std.testing.expectEqual(expected_scroll, next_state.scroll_row);
+
+    var previous_state: State = .{ .cursor_row = view.changes[2].start_row, .syntax_cache = undefined };
+    defer previous_state.folds.deinit(allocator);
+    try jumpChangeInLayout(allocator, snapshot, &previous_state, -1, layout);
+    try std.testing.expectEqual(middle_change, previous_state.cursor_row);
+    try std.testing.expectEqual(expected_scroll, previous_state.scroll_row);
 }
 
 test "moving files jumps to first change in target file" {
