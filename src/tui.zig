@@ -42,7 +42,9 @@ const State = struct {
 const CopyNotice = union(enum) {
     none,
     copied: usize,
+    copied_tmux: usize,
     empty,
+    unavailable,
     comment_added,
     comment_not_added,
 };
@@ -258,8 +260,13 @@ fn handleEvent(
                 '?' => state.help = !state.help,
                 'V' => state.selection_start = state.cursor_row,
                 'y' => {
-                    const copied = try copySelectionToClipboard(allocator, io, snapshot.*, state);
-                    state.copy_notice = if (copied == 0) .empty else .{ .copied = copied };
+                    const result = try copySelectionToClipboard(allocator, io, snapshot.*, state);
+                    state.copy_notice = switch (result) {
+                        .empty => .empty,
+                        .copied => |n| .{ .copied = n },
+                        .copied_tmux => |n| .{ .copied_tmux = n },
+                        .unavailable => .unavailable,
+                    };
                 },
                 'u' => try jumpUnreviewed(allocator, snapshot.*, store.*, state),
                 'r' => {
@@ -323,14 +330,14 @@ fn handleMouse(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
         defer view.deinit(allocator);
         const total = view.rows.len;
         if (total == 0) return;
-        const target = try rowAtVisualOffset(allocator, snapshot, state, view, mouse.y - layout.body_y, layout);
+        const target = rowAtVisualOffset(state, view, snapshot.files[state.active_file], mouse.y - layout.body_y, layout);
         if (left_drag) {
             if (state.selection_start == null) state.selection_start = state.cursor_row;
         } else {
             state.selection_start = null;
         }
         state.cursor_row = target;
-        try ensureCursorVisible(allocator, snapshot, view, state);
+        ensureCursorVisible(snapshot, view, state);
     }
 }
 
@@ -347,7 +354,7 @@ fn render(
     const clear_eol = if (colors) "\x1b[K" else "";
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
-    try ensureRenderViewport(allocator, snapshot, view, state, layout);
+    ensureRenderViewport(snapshot, view, state, layout);
 
     var out: std.ArrayList(u8) = .empty;
     if (colors) try out.appendSlice(allocator, "\x1b[?2026h\x1b[H");
@@ -387,6 +394,8 @@ fn render(
             .none => try std.fmt.allocPrint(allocator, "mode={s}/{s} target={s} syntax={s}  ? help  C unfold/fold  z/Z folds  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .copied_tmux => |line_count| try std.fmt.allocPrint(allocator, "{d} line{s} saved to tmux buffer — Ctrl+b ] to paste  mode={s}/{s} target={s} syntax={s}  install xclip/wl-copy for system clipboard", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .unavailable => try std.fmt.allocPrint(allocator, "clipboard unavailable  mode={s}/{s} target={s} syntax={s}  install xclip/wl-copy or enable OSC 52", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s}/{s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
             .comment_not_added => try std.fmt.allocPrint(allocator, "no diff line in current file  mode={s}/{s} target={s} syntax={s}  c comment", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
         };
@@ -785,6 +794,7 @@ fn wrapAnsiText(allocator: std.mem.Allocator, text: []const u8, width: usize, ma
     return wrapAnsiTextWithWidths(allocator, text, width, width, max_lines);
 }
 
+// Must stay in sync with wrapAnsiTextLineCount — same wrapping algorithm.
 fn wrapAnsiTextWithWidths(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -884,13 +894,56 @@ fn wrapAnsiTextWithWidths(
     return lines.toOwnedSlice(allocator);
 }
 
-fn wrapAnsiTextLineCount(allocator: std.mem.Allocator, text: []const u8, first_width: usize, continuation_width: usize) !usize {
-    const rows = try wrapAnsiTextWithWidths(allocator, text, first_width, continuation_width, std.math.maxInt(usize));
-    defer {
-        for (rows) |row| allocator.free(row);
-        allocator.free(rows);
+// Must stay in sync with wrapAnsiTextWithWidths — same wrapping algorithm.
+fn wrapAnsiTextLineCount(text: []const u8, first_width: usize, continuation_width: usize) usize {
+    if (first_width == 0 and continuation_width == 0) return 1;
+    if (text.len == 0) return 1;
+    var line_count: usize = 1;
+    var visible: usize = 0;
+    var seen_non_space = false;
+    var break_visible_start: usize = 0;
+    var has_break = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\x1b') {
+            i += 1;
+            while (i < text.len and text[i] != 'm') : (i += 1) {}
+            i += 1;
+            continue;
+        }
+        const seq_len = tui_text.utf8SeqLen(text[i]);
+        if (i + seq_len > text.len) break;
+        const char_width = @max(tui_text.displayWidth(text[i .. i + seq_len]), 1);
+        const current_width = if (line_count == 1) first_width else continuation_width;
+        if (visible > 0 and visible + char_width > current_width) {
+            if (has_break) {
+                visible = visible - break_visible_start;
+            } else {
+                visible = 0;
+            }
+            line_count += 1;
+            seen_non_space = false;
+            has_break = false;
+            // re-process the same character on the new line
+            continue;
+        }
+        visible += char_width;
+        const is_space = seq_len == 1 and text[i] == ' ';
+        if (is_space) {
+            if (seen_non_space) {
+                break_visible_start = visible;
+                has_break = true;
+            }
+        } else if (char_width > 0) {
+            seen_non_space = true;
+        }
+        if (!is_space and seen_non_space and isCodeBreakAfterChar(text[i .. i + seq_len])) {
+            break_visible_start = visible;
+            has_break = true;
+        }
+        i += seq_len;
     }
-    return rows.len;
+    return line_count;
 }
 
 fn isCodeBreakAfterChar(bytes: []const u8) bool {
@@ -1290,17 +1343,30 @@ const SelectedText = struct {
     line_count: usize,
 };
 
+const CopyMethod = enum { system, tmux };
+
+const CopyResult = union(enum) {
+    empty,
+    copied: usize,
+    copied_tmux: usize,
+    unavailable,
+};
+
 fn copySelectionToClipboard(
     allocator: std.mem.Allocator,
     io: std.Io,
     snapshot: diff.DiffSnapshot,
     state: *const State,
-) !usize {
+) !CopyResult {
     const selected = try selectedText(allocator, snapshot, state);
     defer allocator.free(selected.bytes);
-    if (selected.bytes.len == 0) return 0;
-    try writeOsc52Clipboard(allocator, io, selected.bytes);
-    return selected.line_count;
+    if (selected.bytes.len == 0) return .empty;
+    const method = writeToClipboard(allocator, io, selected.bytes);
+    return switch (method) {
+        .system => .{ .copied = selected.line_count },
+        .tmux => .{ .copied_tmux = selected.line_count },
+        .none => .unavailable,
+    };
 }
 
 fn selectedText(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *const State) !SelectedText {
@@ -1418,14 +1484,55 @@ fn appendCopyLine(
     line_count.* += 1;
 }
 
-fn writeOsc52Clipboard(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !void {
+fn writeToClipboard(allocator: std.mem.Allocator, io: std.Io, text: []const u8) CopyMethod {
+    // System clipboard tools bypass tmux — preferred.
+    if (trySystemClipboard(io, text)) return .system;
+    // tmux buffer works inside tmux without extra packages.
+    if (tryPipedCommand(io, &.{ "tmux", "load-buffer", "-" }, text)) return .tmux;
+    // OSC 52 as last resort (blocked by tmux, disabled by some terminals).
+    if (tryOsc52(allocator, io, text)) return .system;
+    return .none;
+}
+
+fn trySystemClipboard(io: std.Io, text: []const u8) bool {
+    const candidates = [_][]const []const u8{
+        &.{ "wl-copy" },
+        &.{ "pbcopy" },
+        &.{ "xclip", "-selection", "clipboard" },
+        &.{ "xsel", "--clipboard", "--input" },
+    };
+    for (candidates) |argv| {
+        if (tryPipedCommand(io, argv, text)) return true;
+    }
+    return false;
+}
+
+fn tryOsc52(allocator: std.mem.Allocator, io: std.Io, text: []const u8) bool {
     const encoded_len = std.base64.standard.Encoder.calcSize(text.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
+    const encoded = allocator.alloc(u8, encoded_len) catch return false;
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, text);
-    try writeAll(io, "\x1b]52;c;");
-    try writeAll(io, encoded);
-    try writeAll(io, "\x07");
+    writeAll(io, "\x1b]52;c;") catch return false;
+    writeAll(io, encoded) catch return false;
+    writeAll(io, "\x07") catch return false;
+    return true;
+}
+
+fn tryPipedCommand(io: std.Io, argv: []const []const u8, input: []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    child.stdin.?.writeStreamingAll(io, input) catch {
+        child.kill(io);
+        return false;
+    };
+    child.stdin.?.close(io);
+    child.stdin = null;
+    const term = child.wait(io) catch return false;
+    return term == .exited and term.exited == 0;
 }
 
 fn renderFileTree(
@@ -1469,7 +1576,7 @@ fn moveLine(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *S
     const total = view.rows.len;
     if (total == 0) return;
     state.cursor_row = moveIndex(state.cursor_row, total, delta);
-    try ensureCursorVisible(allocator, snapshot, view, state);
+    ensureCursorVisible(snapshot, view, state);
 }
 
 fn scrollLines(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
@@ -1479,7 +1586,7 @@ fn scrollLines(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     if (total == 0) return;
     state.cursor_row = moveIndex(state.cursor_row, total, delta);
     state.scroll_row = moveIndex(state.scroll_row, total, delta);
-    try ensureCursorVisible(allocator, snapshot, view, state);
+    ensureCursorVisible(snapshot, view, state);
 }
 
 const GotoEdge = enum {
@@ -1525,7 +1632,7 @@ fn jumpToEdge(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: 
         .top => 0,
         .bottom => view.rows.len - 1,
     };
-    try ensureCursorVisible(allocator, snapshot, view, state);
+    ensureCursorVisible(snapshot, view, state);
 }
 
 fn moveFile(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State, delta: isize) !void {
@@ -1549,31 +1656,29 @@ fn moveIndex(current: usize, len: usize, delta: isize) usize {
     return @min(next, len - 1);
 }
 
-fn ensureCursorVisible(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) !void {
+fn ensureCursorVisible(snapshot: diff.DiffSnapshot, view: tui_view.FileView, state: *State) void {
     const layout = Layout.init(terminalSize());
-    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, true);
+    ensureCursorVisibleInLayout(snapshot, view, state, layout, true);
 }
 
 fn ensureRenderViewport(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     view: tui_view.FileView,
     state: *State,
     layout: Layout,
-) !void {
+) void {
     const fill_bottom = !state.preserve_scroll_once;
-    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, fill_bottom);
+    ensureCursorVisibleInLayout(snapshot, view, state, layout, fill_bottom);
     state.preserve_scroll_once = false;
 }
 
 fn ensureCursorVisibleInLayout(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     view: tui_view.FileView,
     state: *State,
     layout: Layout,
     fill_bottom: bool,
-) !void {
+) void {
     const total = view.rows.len;
     if (total == 0) {
         state.scroll_row = 0;
@@ -1583,49 +1688,58 @@ fn ensureCursorVisibleInLayout(
     if (state.scroll_row >= total) state.scroll_row = total - 1;
 
     const file = snapshot.files[state.active_file];
-    while (state.scroll_row < state.cursor_row) {
-        const height = try visualHeightBetween(allocator, snapshot, state, view, state.scroll_row, state.cursor_row + 1, layout);
-        if (height <= layout.body_height) break;
-        state.scroll_row += 1;
+    if (state.scroll_row < state.cursor_row) {
+        // Only advance scroll_row if the cursor row is not visible.
+        const cursor_visible_height = visualHeightBetween(snapshot, state, view, state.scroll_row, state.cursor_row + 1, layout);
+        if (cursor_visible_height > layout.body_height) {
+            var height: usize = 0;
+            var row = state.cursor_row;
+            while (row > state.scroll_row) {
+                const row_height = visualRowHeight(state, file, view.rows[row], layout);
+                if (height + row_height > layout.body_height) break;
+                height += row_height;
+                row -= 1;
+            }
+            state.scroll_row = @max(state.scroll_row, row + 1);
+            state.scroll_row = @min(state.scroll_row, state.cursor_row);
+        }
     }
 
-    const scroll_row_height = visualRowHeight(allocator, snapshot, state, file, view.rows[state.scroll_row], layout) catch 1;
+    const scroll_row_height = visualRowHeight(state, file, view.rows[state.scroll_row], layout);
     if (scroll_row_height > layout.body_height and state.scroll_row < state.cursor_row) {
         state.scroll_row = state.cursor_row;
     }
-    if (fill_bottom) try fillViewportAtBottom(allocator, snapshot, state, view, layout);
+    if (fill_bottom) fillViewportAtBottom(snapshot, state, view, layout);
 }
 
 fn centerCursorInLayout(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     view: tui_view.FileView,
     state: *State,
     layout: Layout,
-) !void {
+) void {
     if (view.rows.len == 0) {
         state.scroll_row = 0;
         return;
     }
     state.cursor_row = @min(state.cursor_row, view.rows.len - 1);
-    state.scroll_row = try centeredScrollRow(allocator, snapshot, state, view, layout);
-    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, false);
+    state.scroll_row = centeredScrollRow(snapshot, state, view, layout);
+    ensureCursorVisibleInLayout(snapshot, view, state, layout, false);
 }
 
 fn centeredScrollRow(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     layout: Layout,
-) !usize {
+) usize {
     const file = snapshot.files[state.active_file];
     const target_offset = layout.body_height / 2;
     var scroll_row = state.cursor_row;
     var height_above: usize = 0;
     while (scroll_row > 0) {
         const prev = scroll_row - 1;
-        const prev_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[prev], layout);
+        const prev_height = visualRowHeight(state, file, view.rows[prev], layout);
         if (height_above + prev_height > target_offset) break;
         height_above += prev_height;
         scroll_row = prev;
@@ -1649,72 +1763,68 @@ const CodeCursorAnchor = struct {
 };
 
 fn captureFoldToggleAnchor(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     target: ?usize,
     layout: Layout,
-) !?CodeCursorAnchor {
-    if (try captureCodeRowAnchor(allocator, snapshot, state, view, state.cursor_row, layout)) |anchor| return anchor;
+) ?CodeCursorAnchor {
+    if (captureCodeRowAnchor(snapshot, state, view, state.cursor_row, layout)) |anchor| return anchor;
     if (target) |target_row| {
         if (target_row < view.rows.len and view.rows[target_row].kind == .fold) {
-            if (try captureFirstVisibleCodeAfterFold(allocator, snapshot, state, view, target_row, layout)) |anchor| return anchor;
+            if (captureFirstVisibleCodeAfterFold(snapshot, state, view, target_row, layout)) |anchor| return anchor;
         }
     }
-    if (try captureFirstVisibleCodeAtOrAfter(allocator, snapshot, state, view, state.cursor_row, null, layout)) |anchor| return anchor;
-    return captureLastVisibleCodeBefore(allocator, snapshot, state, view, state.cursor_row, layout);
+    if (captureFirstVisibleCodeAtOrAfter(snapshot, state, view, state.cursor_row, null, layout)) |anchor| return anchor;
+    return captureLastVisibleCodeBefore(snapshot, state, view, state.cursor_row, layout);
 }
 
 fn captureCodeRowAnchor(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     row_index: usize,
     layout: Layout,
-) !?CodeCursorAnchor {
+) ?CodeCursorAnchor {
     if (row_index >= view.rows.len) return null;
     const row = codeRowAnchor(view.rows[row_index]) orelse return null;
     return .{
         .row = row,
-        .visual_offset = (try visualOffsetIfVisible(allocator, snapshot, state, view, row_index, layout)) orelse 0,
+        .visual_offset = visualOffsetIfVisible(snapshot, state, view, row_index, layout) orelse 0,
     };
 }
 
 fn restoreCodeCursorAnchor(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *State,
     view: tui_view.FileView,
     anchor: ?CodeCursorAnchor,
     layout: Layout,
-) !bool {
+) bool {
     const captured = anchor orelse return false;
     const row_index = findCodeRowByAnchor(view, captured.row) orelse return false;
     state.cursor_row = row_index;
-    state.scroll_row = try scrollRowForVisualOffset(allocator, snapshot, state, view, row_index, captured.visual_offset, layout);
+    state.scroll_row = scrollRowForVisualOffset(snapshot, state, view, row_index, captured.visual_offset, layout);
     state.preserve_scroll_once = true;
-    try ensureCursorVisibleInLayout(allocator, snapshot, view, state, layout, false);
+    ensureCursorVisibleInLayout(snapshot, view, state, layout, false);
     return true;
 }
 
 fn scrollRowForVisualOffset(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     row_index: usize,
     visual_offset: usize,
     layout: Layout,
-) !usize {
+) usize {
     if (view.rows.len == 0) return 0;
     const file = snapshot.files[state.active_file];
     var scroll_row = @min(row_index, view.rows.len - 1);
     var height_above: usize = 0;
     while (scroll_row > 0) {
         const prev = scroll_row - 1;
-        const prev_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[prev], layout);
+        const prev_height = visualRowHeight(state, file, view.rows[prev], layout);
         if (height_above + prev_height > visual_offset) break;
         height_above += prev_height;
         scroll_row = prev;
@@ -1723,31 +1833,29 @@ fn scrollRowForVisualOffset(
 }
 
 fn captureFirstVisibleCodeAfterFold(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     fold_row: usize,
     layout: Layout,
-) !?CodeCursorAnchor {
+) ?CodeCursorAnchor {
     if (fold_row >= view.rows.len) return null;
     const fold_id = view.rows[fold_row].fold_id;
-    return captureFirstVisibleCodeAtOrAfter(allocator, snapshot, state, view, fold_row + 1, fold_id, layout);
+    return captureFirstVisibleCodeAtOrAfter(snapshot, state, view, fold_row + 1, fold_id, layout);
 }
 
 fn captureFirstVisibleCodeAtOrAfter(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     start_row: usize,
     skip_fold_id: ?tui_view.FoldId,
     layout: Layout,
-) !?CodeCursorAnchor {
+) ?CodeCursorAnchor {
     if (view.rows.len == 0) return null;
     var row_index = @max(start_row, state.scroll_row);
     while (row_index < view.rows.len) : (row_index += 1) {
-        const visual_offset = (try visualOffsetIfVisible(allocator, snapshot, state, view, row_index, layout)) orelse break;
+        const visual_offset = visualOffsetIfVisible(snapshot, state, view, row_index, layout) orelse break;
         if (skip_fold_id) |fold_id| {
             if (rowBelongsToFold(view.rows[row_index], fold_id)) continue;
         }
@@ -1758,17 +1866,16 @@ fn captureFirstVisibleCodeAtOrAfter(
 }
 
 fn captureLastVisibleCodeBefore(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     start_row: usize,
     layout: Layout,
-) !?CodeCursorAnchor {
+) ?CodeCursorAnchor {
     if (view.rows.len == 0 or state.scroll_row >= view.rows.len) return null;
     var row_index = @min(start_row, view.rows.len - 1);
     while (row_index >= state.scroll_row) : (row_index -= 1) {
-        const visual_offset = (try visualOffsetIfVisible(allocator, snapshot, state, view, row_index, layout)) orelse return null;
+        const visual_offset = visualOffsetIfVisible(snapshot, state, view, row_index, layout) orelse return null;
         if (codeRowAnchor(view.rows[row_index])) |row| return .{ .row = row, .visual_offset = visual_offset };
         if (row_index == 0) break;
     }
@@ -1776,19 +1883,18 @@ fn captureLastVisibleCodeBefore(
 }
 
 fn visualOffsetIfVisible(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     row_index: usize,
     layout: Layout,
-) !?usize {
+) ?usize {
     if (view.rows.len == 0 or state.scroll_row >= view.rows.len or row_index < state.scroll_row or row_index >= view.rows.len) return null;
     const file = snapshot.files[state.active_file];
     var visual_offset: usize = 0;
     var i = state.scroll_row;
     while (i < row_index) : (i += 1) {
-        visual_offset += try visualRowHeight(allocator, snapshot, state, file, view.rows[i], layout);
+        visual_offset += visualRowHeight(state, file, view.rows[i], layout);
         if (visual_offset >= layout.body_height) return null;
     }
     return visual_offset;
@@ -1844,33 +1950,31 @@ fn optionalSliceEql(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn visualHeightBetween(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
     start: usize,
     end: usize,
     layout: Layout,
-) !usize {
+) usize {
     const file = snapshot.files[state.active_file];
     var height: usize = 0;
-    for (view.rows[start..end]) |row| height += try visualRowHeight(allocator, snapshot, state, file, row, layout);
+    for (view.rows[start..end]) |row| height += visualRowHeight(state, file, row, layout);
     return height;
 }
 
 fn fillViewportAtBottom(
-    allocator: std.mem.Allocator,
     snapshot: diff.DiffSnapshot,
     state: *State,
     view: tui_view.FileView,
     layout: Layout,
-) !void {
+) void {
     if (view.rows.len == 0 or state.scroll_row >= view.rows.len) return;
-    var height = try visualHeightBetween(allocator, snapshot, state, view, state.scroll_row, view.rows.len, layout);
+    var height = visualHeightBetween(snapshot, state, view, state.scroll_row, view.rows.len, layout);
     while (state.scroll_row > 0 and height < layout.body_height) {
         const prev = state.scroll_row - 1;
         const file = snapshot.files[state.active_file];
-        const prev_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[prev], layout);
+        const prev_height = visualRowHeight(state, file, view.rows[prev], layout);
         if (height + prev_height > layout.body_height) break;
         state.scroll_row = prev;
         height += prev_height;
@@ -1878,18 +1982,16 @@ fn fillViewportAtBottom(
 }
 
 fn rowAtVisualOffset(
-    allocator: std.mem.Allocator,
-    snapshot: diff.DiffSnapshot,
     state: *const State,
     view: tui_view.FileView,
+    file: diff.DiffFile,
     offset: usize,
     layout: Layout,
-) !usize {
-    const file = snapshot.files[state.active_file];
+) usize {
     var visual_y: usize = 0;
     var row_index = @min(state.scroll_row, view.rows.len - 1);
     while (row_index < view.rows.len) : (row_index += 1) {
-        const row_height = try visualRowHeight(allocator, snapshot, state, file, view.rows[row_index], layout);
+        const row_height = visualRowHeight(state, file, view.rows[row_index], layout);
         if (offset < visual_y + row_height) return row_index;
         visual_y += row_height;
     }
@@ -1897,50 +1999,47 @@ fn rowAtVisualOffset(
 }
 
 fn visualRowHeight(
-    allocator: std.mem.Allocator,
-    snapshot: diff.DiffSnapshot,
     state: *const State,
     file: diff.DiffFile,
     row: tui_view.VisualRow,
     layout: Layout,
-) !usize {
-    _ = snapshot;
+) usize {
     const line_width = lineNumberWidth(file);
     return switch (row.kind) {
         .file_header, .hunk_header, .fold => 1,
         .stacked_code, .file_meta => if (row.line) |line|
-            try stackedLineHeight(allocator, line, layout.main_width, line_width)
+            stackedLineHeight(line, layout.main_width, line_width)
         else
             1,
-        .split_code => try splitLineHeight(allocator, state, row, layout.main_width, line_width),
+        .split_code => splitLineHeight(state, row, layout.main_width, line_width),
     };
 }
 
-fn stackedLineHeight(allocator: std.mem.Allocator, line: *const diff.DiffLine, width: usize, line_width: usize) !usize {
+fn stackedLineHeight(line: *const diff.DiffLine, width: usize, line_width: usize) usize {
     const prefix_width = 2 + 1 + line_width + 2;
     const wrap_widths = lineWrapWidths(width, prefix_width, line.text);
-    return wrapAnsiTextLineCount(allocator, line.text, wrap_widths.first, wrap_widths.continuation);
+    return wrapAnsiTextLineCount(line.text, wrap_widths.first, wrap_widths.continuation);
 }
 
-fn splitLineHeight(allocator: std.mem.Allocator, state: *const State, row: tui_view.VisualRow, width: usize, line_width: usize) !usize {
+fn splitLineHeight(state: *const State, row: tui_view.VisualRow, width: usize, line_width: usize) usize {
     _ = state;
     if (width < 32) {
-        if (row.right) |right| return stackedLineHeight(allocator, right, width, line_width);
-        if (row.left) |left| return stackedLineHeight(allocator, left, width, line_width);
+        if (row.right) |right| return stackedLineHeight(right, width, line_width);
+        if (row.left) |left| return stackedLineHeight(left, width, line_width);
         return 1;
     }
     const separator_width: usize = 3;
     const side_width = (width - separator_width) / 2;
     const right_width = width - side_width - separator_width;
-    const left_height = if (row.left) |left| try splitCellHeight(allocator, left, side_width, line_width) else 1;
-    const right_height = if (row.right) |right| try splitCellHeight(allocator, right, right_width, line_width) else 1;
+    const left_height = if (row.left) |left| splitCellHeight(left, side_width, line_width) else 1;
+    const right_height = if (row.right) |right| splitCellHeight(right, right_width, line_width) else 1;
     return @max(left_height, right_height);
 }
 
-fn splitCellHeight(allocator: std.mem.Allocator, line: *const diff.DiffLine, width: usize, line_width: usize) !usize {
+fn splitCellHeight(line: *const diff.DiffLine, width: usize, line_width: usize) usize {
     const prefix_width = 1 + 1 + line_width + 2;
     const wrap_widths = lineWrapWidths(width, prefix_width, line.text);
-    return wrapAnsiTextLineCount(allocator, line.text, wrap_widths.first, wrap_widths.continuation);
+    return wrapAnsiTextLineCount(line.text, wrap_widths.first, wrap_widths.continuation);
 }
 
 fn jumpUnreviewed(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, store: store_mod.Store, state: *State) !void {
@@ -1978,7 +2077,7 @@ fn clampCursor(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state:
     }
     state.cursor_row = @min(state.cursor_row, view.rows.len - 1);
     state.scroll_row = @min(state.scroll_row, view.rows.len - 1);
-    try ensureCursorVisible(allocator, snapshot, view, state);
+    ensureCursorVisible(snapshot, view, state);
 }
 
 fn jumpToFirstChange(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot, state: *State) !void {
@@ -2008,7 +2107,7 @@ fn jumpToFirstChangeInCurrentFileInLayout(allocator: std.mem.Allocator, snapshot
     if (view.changes.len == 0) return false;
 
     state.cursor_row = view.changes[0].start_row;
-    try centerCursorInLayout(allocator, snapshot, view, state, layout);
+    centerCursorInLayout(snapshot, view, state, layout);
     return true;
 }
 
@@ -2022,7 +2121,7 @@ fn jumpChangeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnapshot,
     const next = if (delta > 0) tui_view.nextChange(view, state.cursor_row) else tui_view.previousChange(view, state.cursor_row);
     if (next) |row| {
         state.cursor_row = row;
-        try centerCursorInLayout(allocator, snapshot, view, state, layout);
+        centerCursorInLayout(snapshot, view, state, layout);
     }
 }
 
@@ -2037,14 +2136,14 @@ fn toggleCurrentFoldInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSn
     defer view.deinit(allocator);
     if (state.cursor_row >= view.rows.len) return;
     const target = findFoldTarget(view, state.cursor_row) orelse return;
-    const cursor_anchor = try captureFoldToggleAnchor(allocator, snapshot, state, view, target, layout);
+    const cursor_anchor = captureFoldToggleAnchor(snapshot, state, view, target, layout);
     const id = view.rows[target].fold_id orelse return;
     try toggleFold(state, allocator, id);
     var updated = try currentView(allocator, snapshot, state);
     defer updated.deinit(allocator);
-    if (try restoreCodeCursorAnchor(allocator, snapshot, state, updated, cursor_anchor, layout)) return;
+    if (restoreCodeCursorAnchor(snapshot, state, updated, cursor_anchor, layout)) return;
     if (findFoldRowById(updated, id)) |row| state.cursor_row = row else state.cursor_row = @min(target, if (updated.rows.len == 0) 0 else updated.rows.len - 1);
-    try ensureCursorVisibleInLayout(allocator, snapshot, updated, state, layout, true);
+    ensureCursorVisibleInLayout(snapshot, updated, state, layout, true);
 }
 
 fn findFoldTarget(view: tui_view.FileView, cursor_row: usize) ?usize {
@@ -2074,7 +2173,7 @@ fn toggleAllFoldsInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
     const target = findFoldTarget(view, state.cursor_row);
-    const cursor_anchor = try captureFoldToggleAnchor(allocator, snapshot, state, view, target, layout);
+    const cursor_anchor = captureFoldToggleAnchor(snapshot, state, view, target, layout);
     var should_expand = false;
     for (view.rows) |row| {
         if (row.kind == .fold and !row.fold_expanded) {
@@ -2089,7 +2188,7 @@ fn toggleAllFoldsInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
     }
     var updated = try currentView(allocator, snapshot, state);
     defer updated.deinit(allocator);
-    if (try restoreCodeCursorAnchor(allocator, snapshot, state, updated, cursor_anchor, layout)) return;
+    if (restoreCodeCursorAnchor(snapshot, state, updated, cursor_anchor, layout)) return;
     try clampCursor(allocator, snapshot, state);
 }
 
@@ -2101,14 +2200,14 @@ fn toggleFoldModeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
     var view = try currentView(allocator, snapshot, state);
     defer view.deinit(allocator);
     const target = findFoldTarget(view, state.cursor_row);
-    const cursor_anchor = try captureFoldToggleAnchor(allocator, snapshot, state, view, target, layout);
+    const cursor_anchor = captureFoldToggleAnchor(snapshot, state, view, target, layout);
 
     state.fold_mode = if (state.fold_mode == .unfold) .fold else .unfold;
     if (state.fold_mode == .fold) state.folds.clearRetainingCapacity();
 
     var updated = try currentView(allocator, snapshot, state);
     defer updated.deinit(allocator);
-    if (try restoreCodeCursorAnchor(allocator, snapshot, state, updated, cursor_anchor, layout)) return;
+    if (restoreCodeCursorAnchor(snapshot, state, updated, cursor_anchor, layout)) return;
     try clampCursor(allocator, snapshot, state);
 }
 
@@ -3653,14 +3752,14 @@ test "center cursor places target row at viewport midpoint" {
         .syntax_cache = undefined,
     };
 
-    try centerCursorInLayout(std.testing.allocator, snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
+    centerCursorInLayout(snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
 
     try std.testing.expectEqual(@as(usize, 20), state.cursor_row);
     try std.testing.expectEqual(@as(usize, 15), state.scroll_row);
 
     state.cursor_row = 28;
     state.scroll_row = 0;
-    try centerCursorInLayout(std.testing.allocator, snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
+    centerCursorInLayout(snapshot, view, &state, Layout.init(.{ .width = 100, .height = 12 }));
 
     try std.testing.expectEqual(@as(usize, 28), state.cursor_row);
     try std.testing.expectEqual(@as(usize, 23), state.scroll_row);
@@ -3738,7 +3837,7 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
 
     var after = try currentView(allocator, snapshot, &state);
     defer after.deinit(allocator);
-    try ensureRenderViewport(allocator, snapshot, after, &state, layout);
+    ensureRenderViewport(snapshot, after, &state, layout);
     try std.testing.expectEqual(@as(usize, 0), state.cursor_row);
     try std.testing.expectEqual(@as(usize, 0), state.scroll_row);
     try std.testing.expectEqual(@as(usize, 0), state.folds.items.len);
@@ -3771,16 +3870,16 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
         }
     }
     const line_115_collapsed = collapsed_line_115_row orelse return error.TestExpectedEqual;
-    const collapsed_offset = try visualHeightBetween(allocator, snapshot, &fold_state, before_fold, fold_state.scroll_row, line_115_collapsed, layout);
+    const collapsed_offset = visualHeightBetween(snapshot, &fold_state, before_fold, fold_state.scroll_row, line_115_collapsed, layout);
 
     try toggleCurrentFoldInLayout(allocator, snapshot, &fold_state, layout);
 
     var after_fold = try currentView(allocator, snapshot, &fold_state);
     defer after_fold.deinit(allocator);
-    try ensureRenderViewport(allocator, snapshot, after_fold, &fold_state, layout);
+    ensureRenderViewport(snapshot, after_fold, &fold_state, layout);
     const fold_line = after_fold.rows[fold_state.cursor_row].line orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("line 115", fold_line.text);
-    const fold_offset = try visualHeightBetween(allocator, snapshot, &fold_state, after_fold, fold_state.scroll_row, fold_state.cursor_row, layout);
+    const fold_offset = visualHeightBetween(snapshot, &fold_state, after_fold, fold_state.scroll_row, fold_state.cursor_row, layout);
     try std.testing.expectEqual(collapsed_offset, fold_offset);
 
     var all_state: State = .{
@@ -3802,10 +3901,10 @@ test "fold toggle requires fold row and preserves code offset in tall viewport" 
 
     var after_all_expanded = try currentView(allocator, snapshot, &all_state);
     defer after_all_expanded.deinit(allocator);
-    try ensureRenderViewport(allocator, snapshot, after_all_expanded, &all_state, layout);
+    ensureRenderViewport(snapshot, after_all_expanded, &all_state, layout);
     const all_line = after_all_expanded.rows[all_state.cursor_row].line orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("line 115", all_line.text);
-    const all_offset = try visualHeightBetween(allocator, snapshot, &all_state, after_all_expanded, all_state.scroll_row, all_state.cursor_row, layout);
+    const all_offset = visualHeightBetween(snapshot, &all_state, after_all_expanded, all_state.scroll_row, all_state.cursor_row, layout);
     try std.testing.expectEqual(collapsed_offset, all_offset);
 
     try toggleAllFoldsInLayout(allocator, snapshot, &all_state, layout);
