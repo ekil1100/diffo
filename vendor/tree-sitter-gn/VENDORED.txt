@@ -1,0 +1,6 @@
+license: MIT
+
+tree-sitter-gn grammar
+repo: https://github.com/tree-sitter-grammars/tree-sitter-gn
+commit: N/A (fetched via raw.githubusercontent.com from master)
+license: MIT

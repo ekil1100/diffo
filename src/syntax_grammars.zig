@@ -10,6 +10,7 @@ extern fn tree_sitter_rust() tree_sitter.Language;
 extern fn tree_sitter_c() tree_sitter.Language;
 extern fn tree_sitter_cpp() tree_sitter.Language;
 extern fn tree_sitter_python() tree_sitter.Language;
+extern fn tree_sitter_gn() tree_sitter.Language;
 
 pub const Grammar = struct {
     name: []const u8,
@@ -38,6 +39,7 @@ const cpp_query =
     "\n" ++
     @embedFile("syntax_queries/cpp_highlights.scm");
 const python_query = @embedFile("syntax_queries/python_highlights.scm");
+const gn_query = @embedFile("syntax_queries/gn_highlights.scm");
 
 pub fn find(language: []const u8) ?Grammar {
     if (util.eql(language, "zig")) {
@@ -96,15 +98,22 @@ pub fn find(language: []const u8) ?Grammar {
             .language_fn = tree_sitter_python,
         };
     }
+    if (util.eql(language, "gn")) {
+        return .{
+            .name = "gn",
+            .query = gn_query,
+            .language_fn = tree_sitter_gn,
+        };
+    }
     return null;
 }
 
 pub fn count() usize {
-    return 8;
+    return 9;
 }
 
 test "finds bundled grammars" {
-    const languages = [_][]const u8{ "zig", "javascript", "typescript", "tsx", "rust", "c", "cpp", "python" };
+    const languages = [_][]const u8{ "zig", "javascript", "typescript", "tsx", "rust", "c", "cpp", "python", "gn" };
     for (languages) |language| {
         const grammar = find(language) orelse return error.TestExpectedEqual;
         try std.testing.expect(util.eql(grammar.name, language));

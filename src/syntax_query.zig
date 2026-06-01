@@ -314,6 +314,7 @@ test "bundled tree-sitter grammars produce highlight spans" {
         .{ .language = "c", .source = "int main(void) { return 0; }\n" },
         .{ .language = "cpp", .source = "class App { public: int run(); };\n" },
         .{ .language = "python", .source = "def run() -> bool:\n    return True\n" },
+        .{ .language = "gn", .source = "executable(\"foo\") {\n  sources = [ \"foo.cc\" ]\n}\n" },
     };
     for (samples) |sample| {
         const grammar = grammars.find(sample.language) orelse return error.TestUnexpectedResult;

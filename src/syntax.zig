@@ -99,6 +99,7 @@ test "language mode reports disabled for unsupported languages" {
     try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("c"));
     try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("cpp"));
     try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("python"));
+    try std.testing.expectEqual(HighlightMode.tree_sitter, modeForLanguage("gn"));
     try std.testing.expectEqual(HighlightMode.disabled, modeForLanguage("markdown"));
     try std.testing.expectEqual(HighlightMode.disabled, modeForLanguage(null));
 }

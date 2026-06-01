@@ -475,6 +475,7 @@ fn detectLanguage(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     if (util.eql(base, "Makefile")) return try util.dupe(allocator, "make");
     if (util.eql(base, "Dockerfile")) return try util.dupe(allocator, "dockerfile");
     if (util.eql(base, "build.zig")) return try util.dupe(allocator, "zig");
+    if (util.eql(base, ".gn")) return try util.dupe(allocator, "gn");
     const ext = std.fs.path.extension(path);
     if (ext.len == 0) return null;
     const lang = if (util.eql(ext, ".zig"))
@@ -503,6 +504,8 @@ fn detectLanguage(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
         "json"
     else if (util.eql(ext, ".html"))
         "html"
+    else if (util.eql(ext, ".gn") or util.eql(ext, ".gni"))
+        "gn"
     else if (util.eql(ext, ".css"))
         "css"
     else
@@ -528,6 +531,9 @@ test "detects languages requested for highlighting" {
         .{ .path = "include/main.hh", .language = "cpp" },
         .{ .path = "scripts/tool.py", .language = "python" },
         .{ .path = "scripts/tool.pyw", .language = "python" },
+        .{ .path = "BUILD.gn", .language = "gn" },
+        .{ .path = "build/config/BUILDCONFIG.gn", .language = "gn" },
+        .{ .path = "imports.gni", .language = "gn" },
     };
     for (samples) |sample| {
         const language = (try detectLanguage(allocator, sample.path)) orelse return error.TestExpectedEqual;

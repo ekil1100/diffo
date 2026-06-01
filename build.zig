@@ -57,6 +57,7 @@ fn addSyntaxNativeSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("vendor/tree-sitter-c/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-cpp/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-python/src"));
+    module.addIncludePath(b.path("vendor/tree-sitter-gn/src"));
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
         .flags = &.{ "-std=c11", "-O2" },
@@ -75,6 +76,8 @@ fn addSyntaxNativeSources(b: *std.Build, module: *std.Build.Module) void {
     addC11Source(b, module, "vendor/tree-sitter-cpp/src/scanner.c");
     addC11Source(b, module, "vendor/tree-sitter-python/src/parser.c");
     addC11Source(b, module, "vendor/tree-sitter-python/src/scanner.c");
+    addC11Source(b, module, "vendor/tree-sitter-gn/src/parser.c");
+    addC11Source(b, module, "vendor/tree-sitter-gn/src/scanner.c");
 }
 
 fn addC11Source(b: *std.Build, module: *std.Build.Module, path: []const u8) void {
