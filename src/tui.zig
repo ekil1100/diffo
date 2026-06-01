@@ -1343,7 +1343,7 @@ const SelectedText = struct {
     line_count: usize,
 };
 
-const CopyMethod = enum { system, tmux };
+const CopyMethod = enum { system, tmux, none };
 
 const CopyResult = union(enum) {
     empty,
