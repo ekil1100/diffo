@@ -249,7 +249,7 @@ fn handleEvent(
                 'J' => try moveFile(allocator, snapshot.*, state, 1),
                 'K' => try moveFile(allocator, snapshot.*, state, -1),
                 'n' => try jumpChange(allocator, snapshot.*, state, 1),
-                'N' => try jumpChange(allocator, snapshot.*, state, -1),
+                'p' => try jumpChange(allocator, snapshot.*, state, -1),
                 'z' => try toggleCurrentFold(allocator, snapshot.*, state),
                 'Z' => try toggleAllFolds(allocator, snapshot.*, state),
                 'C' => try toggleFoldMode(allocator, snapshot.*, state),
@@ -386,7 +386,7 @@ fn render(
     }
 
     if (state.help) {
-        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/N change  C unfold/fold  z/Z folds  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
+        try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/p change  C unfold/fold  z/Z folds  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
     } else {
         const active_file = snapshot.files[state.active_file];
         const syntax_mode = activeSyntaxMode(snapshot, active_file);

@@ -116,7 +116,7 @@ When stdout is not a TTY, `diffo` renders a static diff screen instead of enteri
 | `G` / `gg` | 跳到当前文件 diff 的底部 / 顶部 |
 | `PageUp` / `PageDown` | Scroll by a larger step |
 | `J` / `K` | Move to next / previous file |
-| `n` / `N` | Jump to next / previous change |
+| `n` / `p` | Jump to next / previous change |
 | `C` | Toggle unfold / fold mode |
 | `z` | Toggle the fold at the cursor in fold mode |
 | `Z` | Toggle all folds in the current file in fold mode |
