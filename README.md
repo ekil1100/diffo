@@ -25,7 +25,7 @@ Use `diffo` when you want a fast local pass over changes before a commit, push, 
 - Store state outside the repository using XDG state paths.
 - Use Catppuccin Mocha as the built-in default theme.
 - Validate Base16/Base24 theme files.
-- Apply syntax highlighting when terminal color support is available. Bundled Tree-sitter grammars are used for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, and Python files.
+- Apply syntax highlighting when terminal color support is available. Bundled Tree-sitter grammars are used for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, Python, and GN files.
 
 ## Install
 
@@ -113,7 +113,7 @@ When stdout is not a TTY, `diffo` renders a static diff screen instead of enteri
 | --- | --- |
 | `j` / `k` | Move down / up within the current file diff |
 | `↑` / `↓` | Move down / up within the current file diff |
-| `G` / `gg` | 跳到当前文件 diff 的底部 / 顶部 |
+| `G` / `gg` | Jump to the bottom / top of the current file diff |
 | `PageUp` / `PageDown` | Scroll by a larger step |
 | `J` / `K` | Move to next / previous file |
 | `n` / `p` | Jump to next / previous change |
@@ -160,7 +160,7 @@ diffo comments list --file src/main.zig
 diffo comments list --json
 ```
 
-`comments list` 会显示当前仓库保存的评论，包括在 `diffo HEAD^` 这类显式 review target 中创建的评论。
+`comments list` shows all comments saved for the current repository, including comments created under explicit review targets such as `diffo HEAD^`.
 
 Get one comment:
 
@@ -169,7 +169,7 @@ diffo comments get cmt_0123456789abcdef
 diffo comments get cmt_0123456789abcdef --json
 ```
 
-清理当前 review target 中已经过期的注释（锚点状态为 `stale` 或 `missing`），或用 `--all` 删除仓库中保存的所有注释：
+Clean up comments in the current review target whose anchors have expired (match status `stale` or `missing`), or remove every comment saved for the repository with `--all`:
 
 ```sh
 diffo comments clean
@@ -282,7 +282,7 @@ Writes use a temporary file followed by rename, so interrupted writes should not
 
 ## Current V1 Limits
 
-- Tree-sitter highlighting is currently bundled for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, and Python files; unsupported languages, large files, and unavailable source sides are shown without syntax highlighting.
+- Tree-sitter highlighting is currently bundled for Zig, TypeScript/TSX, JavaScript, Rust, C, C++, Python, and GN files; unsupported languages, large files, and unavailable source sides are shown without syntax highlighting.
 - Comment relocation is minimal: comments become `stale` when the patch fingerprint changes.
 - Runtime theme switching and full config loading are not implemented yet.
 - Mouse support covers click selection and scroll wheel navigation; richer filtering/search can be added later.
