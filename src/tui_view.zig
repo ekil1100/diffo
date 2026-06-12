@@ -143,9 +143,12 @@ pub fn buildFileView(
     errdefer changes.deinit(allocator);
     assignChanges(allocator, &rows, &changes) catch |err| return err;
 
+    const rows_slice = try rows.toOwnedSlice(allocator);
+    errdefer allocator.free(rows_slice);
+    const changes_slice = try changes.toOwnedSlice(allocator);
     return .{
-        .rows = try rows.toOwnedSlice(allocator),
-        .changes = try changes.toOwnedSlice(allocator),
+        .rows = rows_slice,
+        .changes = changes_slice,
         .additions = additions,
         .deletions = deletions,
     };
@@ -391,7 +394,7 @@ pub fn previousChange(view: FileView, cursor_row: usize) ?usize {
     var found: ?usize = null;
     for (view.changes) |change| {
         if (change.start_row >= cursor_row) break;
-        if (change.start_row < cursor_row) found = change.start_row;
+        found = change.start_row;
     }
     return found;
 }

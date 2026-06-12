@@ -97,6 +97,29 @@ pub const Ansi = struct {
     pub fn reset(self: Ansi) []const u8 {
         return if (self.enabled) "\x1b[0m" else "";
     }
+
+    /// Write the foreground escape into a caller-owned buffer and return the slice (empty when
+    /// colour is disabled). Avoids the per-call heap allocation that fg() incurs on the hot
+    /// per-cell / per-span render path. The returned slice borrows `buf`.
+    pub fn fgInto(self: Ansi, buf: *[24]u8, color: Color) []const u8 {
+        return self.sgrColorInto(buf, "38", color);
+    }
+
+    pub fn bgInto(self: Ansi, buf: *[24]u8, color: Color) []const u8 {
+        return self.sgrColorInto(buf, "48", color);
+    }
+
+    fn sgrColorInto(self: Ansi, buf: *[24]u8, comptime plane: []const u8, color: Color) []const u8 {
+        if (!self.enabled or !self.true_color) return "";
+        const rgb = parseHex(color.hex) orelse return "";
+        return std.fmt.bufPrint(buf, "\x1b[" ++ plane ++ ";2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b }) catch "";
+    }
+
+    /// Append the foreground escape directly to `out`, allocation-free.
+    pub fn appendFg(self: Ansi, allocator: std.mem.Allocator, out: *std.ArrayList(u8), color: Color) !void {
+        var buf: [24]u8 = undefined;
+        try out.appendSlice(allocator, self.fgInto(&buf, color));
+    }
 };
 
 const Rgb = struct { r: u8, g: u8, b: u8 };
@@ -117,19 +140,37 @@ pub fn validateBaseThemeFile(allocator: std.mem.Allocator, io: std.Io, path: []c
     var base16_count: usize = 0;
     var base24_count: usize = 0;
     var idx: u8 = 0;
-    while (idx < 16) : (idx += 1) {
-        var key_buf: [6]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "base{x:0>2}", .{idx}) catch unreachable;
-        if (util.contains(content, key)) base16_count += 1;
-    }
-    idx = 16;
     while (idx < 24) : (idx += 1) {
         var key_buf: [6]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "base{x:0>2}", .{idx}) catch unreachable;
-        if (util.contains(content, key)) base24_count += 1;
+        // Require each baseNN key to carry a real 6-hex colour on its line, not merely appear as
+        // a substring, so arbitrary files that happen to contain "base00" are not accepted.
+        if (!keyHasHexColor(content, key)) continue;
+        if (idx < 16) base16_count += 1 else base24_count += 1;
     }
     if (base16_count < 16) return error.ThemeInvalid;
     return std.fmt.allocPrint(allocator, "valid Base{s} theme ({d} color slots)", .{ if (base24_count >= 8) "24" else "16", base16_count + base24_count });
+}
+
+fn keyHasHexColor(content: []const u8, key: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, content, search_from, key)) |key_idx| {
+        const after = content[key_idx + key.len ..];
+        const line_end = std.mem.indexOfScalar(u8, after, '\n') orelse after.len;
+        if (lineContainsHexColor(after[0..line_end])) return true;
+        search_from = key_idx + key.len;
+    }
+    return false;
+}
+
+fn lineContainsHexColor(line: []const u8) bool {
+    var i: usize = 0;
+    while (i + 6 <= line.len) : (i += 1) {
+        const before_ok = i == 0 or !std.ascii.isHex(line[i - 1]);
+        const after_ok = i + 6 == line.len or !std.ascii.isHex(line[i + 6]);
+        if (before_ok and after_ok and parseHex(line[i .. i + 6]) != null) return true;
+    }
+    return false;
 }
 
 pub fn listBuiltins(allocator: std.mem.Allocator) ![]u8 {

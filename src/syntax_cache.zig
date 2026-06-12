@@ -23,14 +23,23 @@ pub const SyntaxCache = struct {
     debug_git: bool,
     entries: std.ArrayList(Entry) = .empty,
 
+    const Status = enum { ready, unavailable, too_large };
+
     const Entry = struct {
         file_index: usize,
         side: git.FileSide,
-        highlight: syntax_query.SideHighlight,
+        status: Status,
+        highlight: ?syntax_query.SideHighlight,
 
         fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
-            self.highlight.deinit(allocator);
+            if (self.highlight) |*highlight| highlight.deinit(allocator);
         }
+    };
+
+    const Outcome = union(enum) {
+        ready: syntax_query.SideHighlight,
+        unavailable,
+        too_large,
     };
 
     pub fn init(
@@ -73,20 +82,50 @@ pub const SyntaxCache = struct {
 
     fn get(self: *SyntaxCache, file_index: usize, file: diff.DiffFile, side: git.FileSide) Error!*syntax_query.SideHighlight {
         for (self.entries.items) |*entry| {
-            if (entry.file_index == file_index and entry.side == side) return &entry.highlight;
+            if (entry.file_index == file_index and entry.side == side) {
+                return switch (entry.status) {
+                    .ready => &entry.highlight.?,
+                    .unavailable => error.SyntaxUnavailable,
+                    .too_large => error.SourceTooLarge,
+                };
+            }
         }
-        const language = file.language orelse return error.SyntaxUnavailable;
-        const grammar = syntax_grammars.find(language) orelse return error.SyntaxUnavailable;
-        const source = try git.loadFileSide(self.allocator, self.io, self.repo, self.target, file, side, self.debug_git) orelse return error.SyntaxUnavailable;
-        errdefer self.allocator.free(source);
-        if (source.len > max_file_size) return error.SourceTooLarge;
+        // Compute the outcome once and cache it — including the negative results — so an
+        // unavailable or too-large side never re-spawns git / re-reads the blob on later frames.
+        var outcome = try self.computeOutcome(file, side);
+        switch (outcome) {
+            .ready => {
+                errdefer outcome.ready.deinit(self.allocator);
+                try self.entries.append(self.allocator, .{
+                    .file_index = file_index,
+                    .side = side,
+                    .status = .ready,
+                    .highlight = outcome.ready,
+                });
+                return &self.entries.items[self.entries.items.len - 1].highlight.?;
+            },
+            .unavailable => {
+                try self.entries.append(self.allocator, .{ .file_index = file_index, .side = side, .status = .unavailable, .highlight = null });
+                return error.SyntaxUnavailable;
+            },
+            .too_large => {
+                try self.entries.append(self.allocator, .{ .file_index = file_index, .side = side, .status = .too_large, .highlight = null });
+                return error.SourceTooLarge;
+            },
+        }
+    }
+
+    fn computeOutcome(self: *SyntaxCache, file: diff.DiffFile, side: git.FileSide) Error!Outcome {
+        const language = file.language orelse return .unavailable;
+        const grammar = syntax_grammars.find(language) orelse return .unavailable;
+        const source = try git.loadFileSide(self.allocator, self.io, self.repo, self.target, file, side, self.debug_git) orelse return .unavailable;
+        if (source.len > max_file_size) {
+            self.allocator.free(source);
+            return .too_large;
+        }
+        // build() takes ownership of source and frees it on its own error paths.
         const highlight = try syntax_query.build(self.allocator, grammar.language(), grammar.query, source);
-        try self.entries.append(self.allocator, .{
-            .file_index = file_index,
-            .side = side,
-            .highlight = highlight,
-        });
-        return &self.entries.items[self.entries.items.len - 1].highlight;
+        return .{ .ready = highlight };
     }
 };
 

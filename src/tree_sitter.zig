@@ -29,6 +29,9 @@ pub const Parser = struct {
     }
 
     pub fn parse(self: Parser, source: []const u8) Error!Tree {
+        // tree-sitter byte offsets are u32; reject oversize input here rather than panicking on
+        // the cast, regardless of what a caller passes or which optimize mode is in use.
+        if (source.len > std.math.maxInt(u32)) return error.TreeSitterParseFailed;
         const raw = c.ts_parser_parse_string(self.raw, null, source.ptr, @intCast(source.len)) orelse return error.TreeSitterParseFailed;
         return .{ .raw = raw };
     }
@@ -50,9 +53,14 @@ pub const Query = struct {
     raw: *c.TSQuery,
 
     pub fn init(language: Language, source: []const u8) Error!Query {
+        if (source.len > std.math.maxInt(u32)) return error.TreeSitterQueryInvalid;
         var error_offset: u32 = 0;
         var error_type: c.TSQueryError = c.TSQueryErrorNone;
-        const raw = c.ts_query_new(language, source.ptr, @intCast(source.len), &error_offset, &error_type) orelse return error.TreeSitterQueryInvalid;
+        const raw = c.ts_query_new(language, source.ptr, @intCast(source.len), &error_offset, &error_type) orelse {
+            // Surface the compile failure location/category instead of collapsing it silently.
+            std.log.warn("tree-sitter query compile failed: error_type={d} at byte offset {d}", .{ error_type, error_offset });
+            return error.TreeSitterQueryInvalid;
+        };
         return .{ .raw = raw };
     }
 

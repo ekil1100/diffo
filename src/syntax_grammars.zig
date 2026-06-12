@@ -108,10 +108,6 @@ pub fn find(language: []const u8) ?Grammar {
     return null;
 }
 
-pub fn count() usize {
-    return 9;
-}
-
 test "finds bundled grammars" {
     const languages = [_][]const u8{ "zig", "javascript", "typescript", "tsx", "rust", "c", "cpp", "python", "gn" };
     for (languages) |language| {

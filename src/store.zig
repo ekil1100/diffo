@@ -148,32 +148,46 @@ pub const Store = struct {
     pub fn setReviewed(self: *Store, repository_id: []const u8, target_id: []const u8, file: diff.DiffFile, reviewed: bool) StoreError!void {
         const now = try util.nowIso(self.allocator, self.io);
         defer self.allocator.free(now);
+        const status_text = if (reviewed) "reviewed" else "unreviewed";
         for (self.states) |*state| {
             if (util.eql(state.file_path, file.path) and util.eql(state.review_target_id, target_id)) {
-                self.allocator.free(state.status);
-                self.allocator.free(state.patch_fingerprint);
-                self.allocator.free(state.updated_at);
-                state.status = try util.dupe(self.allocator, if (reviewed) "reviewed" else "unreviewed");
-                state.patch_fingerprint = try util.dupe(self.allocator, file.patch_fingerprint);
-                state.updated_at = try util.dupe(self.allocator, now);
+                // Build the replacement entry fully before touching `state` (commit-last) so an
+                // OOM cannot leave it half-updated or dangling; makeReviewState frees its own
+                // partials on failure.
+                const new_state = try makeReviewState(self.allocator, .{
+                    .repository_id = state.repository_id,
+                    .review_target_id = state.review_target_id,
+                    .file_path = state.file_path,
+                    .status = status_text,
+                    .patch_fingerprint = file.patch_fingerprint,
+                    .updated_at = now,
+                });
+                state.deinit(self.allocator);
+                state.* = new_state;
                 try self.saveStates();
                 return;
             }
         }
 
+        var new_state = try makeReviewState(self.allocator, .{
+            .repository_id = repository_id,
+            .review_target_id = target_id,
+            .file_path = file.path,
+            .status = status_text,
+            .patch_fingerprint = file.patch_fingerprint,
+            .updated_at = now,
+        });
+        var committed = false;
+        errdefer if (!committed) new_state.deinit(self.allocator);
         var list: std.ArrayList(ReviewState) = .empty;
         defer list.deinit(self.allocator);
         try list.appendSlice(self.allocator, self.states);
-        try list.append(self.allocator, .{
-            .repository_id = try util.dupe(self.allocator, repository_id),
-            .review_target_id = try util.dupe(self.allocator, target_id),
-            .file_path = try util.dupe(self.allocator, file.path),
-            .status = try util.dupe(self.allocator, if (reviewed) "reviewed" else "unreviewed"),
-            .patch_fingerprint = try util.dupe(self.allocator, file.patch_fingerprint),
-            .updated_at = try util.dupe(self.allocator, now),
-        });
+        try list.append(self.allocator, new_state);
+        // Obtain the new backing slice before freeing the old one so self.states never dangles.
+        const new_states = try list.toOwnedSlice(self.allocator);
         self.allocator.free(self.states);
-        self.states = try list.toOwnedSlice(self.allocator);
+        self.states = new_states;
+        committed = true;
         try self.saveStates();
     }
 
@@ -205,34 +219,39 @@ pub const Store = struct {
         const id_hash = try util.hashHex(self.allocator, id_input);
         defer self.allocator.free(id_hash);
         const comment_id = try std.fmt.allocPrint(self.allocator, "cmt_{s}", .{id_hash[0..16]});
+        defer self.allocator.free(comment_id);
 
-        var comment = Comment{
+        // Deep-dupe every field up front (buildComment frees partials on OOM) so a later
+        // failure cannot leak, and guard the built comment until it is committed.
+        var comment = try buildComment(self.allocator, .{
             .comment_id = comment_id,
-            .repository_id = try util.dupe(self.allocator, repository_id),
-            .review_target_id = try util.dupe(self.allocator, target_id),
-            .file_path = try util.dupe(self.allocator, file.path),
-            .side = try util.dupe(self.allocator, side),
+            .repository_id = repository_id,
+            .review_target_id = target_id,
+            .file_path = file.path,
+            .side = side,
             .start_line = start_line,
             .end_line = if (end_line == 0) start_line else end_line,
-            .stable_line_id = try util.dupe(self.allocator, line.stable_line_id),
-            .hunk_header = try util.dupe(self.allocator, hunk_header),
-            .context_before = try util.dupe(self.allocator, ""),
-            .context_after = try util.dupe(self.allocator, ""),
-            .patch_fingerprint = try util.dupe(self.allocator, file.patch_fingerprint),
-            .match_status = .exact,
-            .body = try util.dupe(self.allocator, body),
-            .author = try util.dupe(self.allocator, author),
-            .created_at = try util.dupe(self.allocator, now),
-            .updated_at = try util.dupe(self.allocator, now),
-        };
-        errdefer comment.deinit(self.allocator);
+            .stable_line_id = line.stable_line_id,
+            .hunk_header = hunk_header,
+            .patch_fingerprint = file.patch_fingerprint,
+            .body = body,
+            .author = author,
+            .created_at = now,
+            .updated_at = now,
+        });
+        var committed = false;
+        errdefer if (!committed) comment.deinit(self.allocator);
 
         var list: std.ArrayList(Comment) = .empty;
         defer list.deinit(self.allocator);
         try list.appendSlice(self.allocator, self.comments);
         try list.append(self.allocator, comment);
+        // Build the new backing slice before releasing the old one so self.comments is never
+        // left dangling if toOwnedSlice fails.
+        const new_comments = try list.toOwnedSlice(self.allocator);
         self.allocator.free(self.comments);
-        self.comments = try list.toOwnedSlice(self.allocator);
+        self.comments = new_comments;
+        committed = true; // comment is now owned by self.comments; stop guarding it
         try self.saveComments();
         return cloneComment(self.allocator, comment);
     }
@@ -466,25 +485,130 @@ fn commentFromJson(allocator: std.mem.Allocator, item: std.json.Value) StoreErro
     };
 }
 
-fn cloneComment(allocator: std.mem.Allocator, comment: Comment) !Comment {
+const CommentInit = struct {
+    comment_id: []const u8,
+    repository_id: []const u8,
+    review_target_id: []const u8,
+    file_path: []const u8,
+    side: []const u8,
+    start_line: u32,
+    end_line: u32,
+    stable_line_id: []const u8,
+    hunk_header: []const u8,
+    context_before: []const u8 = "",
+    context_after: []const u8 = "",
+    patch_fingerprint: []const u8,
+    match_status: MatchStatus = .exact,
+    body: []const u8,
+    author: []const u8,
+    created_at: []const u8,
+    updated_at: []const u8,
+};
+
+/// Deep-dupe every string field of a comment. On any allocation failure the fields duped so
+/// far are freed (via errdefer) before returning the error, so a partial comment never leaks.
+/// On success the errdefers do not run and the returned Comment owns all of its memory.
+fn buildComment(allocator: std.mem.Allocator, init: CommentInit) !Comment {
+    const comment_id = try util.dupe(allocator, init.comment_id);
+    errdefer allocator.free(comment_id);
+    const repository_id = try util.dupe(allocator, init.repository_id);
+    errdefer allocator.free(repository_id);
+    const review_target_id = try util.dupe(allocator, init.review_target_id);
+    errdefer allocator.free(review_target_id);
+    const file_path = try util.dupe(allocator, init.file_path);
+    errdefer allocator.free(file_path);
+    const side = try util.dupe(allocator, init.side);
+    errdefer allocator.free(side);
+    const stable_line_id = try util.dupe(allocator, init.stable_line_id);
+    errdefer allocator.free(stable_line_id);
+    const hunk_header = try util.dupe(allocator, init.hunk_header);
+    errdefer allocator.free(hunk_header);
+    const context_before = try util.dupe(allocator, init.context_before);
+    errdefer allocator.free(context_before);
+    const context_after = try util.dupe(allocator, init.context_after);
+    errdefer allocator.free(context_after);
+    const patch_fingerprint = try util.dupe(allocator, init.patch_fingerprint);
+    errdefer allocator.free(patch_fingerprint);
+    const body = try util.dupe(allocator, init.body);
+    errdefer allocator.free(body);
+    const author = try util.dupe(allocator, init.author);
+    errdefer allocator.free(author);
+    const created_at = try util.dupe(allocator, init.created_at);
+    errdefer allocator.free(created_at);
+    const updated_at = try util.dupe(allocator, init.updated_at);
+    errdefer allocator.free(updated_at);
     return .{
-        .comment_id = try util.dupe(allocator, comment.comment_id),
-        .repository_id = try util.dupe(allocator, comment.repository_id),
-        .review_target_id = try util.dupe(allocator, comment.review_target_id),
-        .file_path = try util.dupe(allocator, comment.file_path),
-        .side = try util.dupe(allocator, comment.side),
+        .comment_id = comment_id,
+        .repository_id = repository_id,
+        .review_target_id = review_target_id,
+        .file_path = file_path,
+        .side = side,
+        .start_line = init.start_line,
+        .end_line = init.end_line,
+        .stable_line_id = stable_line_id,
+        .hunk_header = hunk_header,
+        .context_before = context_before,
+        .context_after = context_after,
+        .patch_fingerprint = patch_fingerprint,
+        .match_status = init.match_status,
+        .body = body,
+        .author = author,
+        .created_at = created_at,
+        .updated_at = updated_at,
+    };
+}
+
+fn cloneComment(allocator: std.mem.Allocator, comment: Comment) !Comment {
+    return buildComment(allocator, .{
+        .comment_id = comment.comment_id,
+        .repository_id = comment.repository_id,
+        .review_target_id = comment.review_target_id,
+        .file_path = comment.file_path,
+        .side = comment.side,
         .start_line = comment.start_line,
         .end_line = comment.end_line,
-        .stable_line_id = try util.dupe(allocator, comment.stable_line_id),
-        .hunk_header = try util.dupe(allocator, comment.hunk_header),
-        .context_before = try util.dupe(allocator, comment.context_before),
-        .context_after = try util.dupe(allocator, comment.context_after),
-        .patch_fingerprint = try util.dupe(allocator, comment.patch_fingerprint),
+        .stable_line_id = comment.stable_line_id,
+        .hunk_header = comment.hunk_header,
+        .context_before = comment.context_before,
+        .context_after = comment.context_after,
+        .patch_fingerprint = comment.patch_fingerprint,
         .match_status = comment.match_status,
-        .body = try util.dupe(allocator, comment.body),
-        .author = try util.dupe(allocator, comment.author),
-        .created_at = try util.dupe(allocator, comment.created_at),
-        .updated_at = try util.dupe(allocator, comment.updated_at),
+        .body = comment.body,
+        .author = comment.author,
+        .created_at = comment.created_at,
+        .updated_at = comment.updated_at,
+    });
+}
+
+const ReviewStateInit = struct {
+    repository_id: []const u8,
+    review_target_id: []const u8,
+    file_path: []const u8,
+    status: []const u8,
+    patch_fingerprint: []const u8,
+    updated_at: []const u8,
+};
+
+/// Deep-dupe every field of a review state, freeing partials on OOM (see buildComment).
+fn makeReviewState(allocator: std.mem.Allocator, init: ReviewStateInit) !ReviewState {
+    const repository_id = try util.dupe(allocator, init.repository_id);
+    errdefer allocator.free(repository_id);
+    const review_target_id = try util.dupe(allocator, init.review_target_id);
+    errdefer allocator.free(review_target_id);
+    const file_path = try util.dupe(allocator, init.file_path);
+    errdefer allocator.free(file_path);
+    const status = try util.dupe(allocator, init.status);
+    errdefer allocator.free(status);
+    const patch_fingerprint = try util.dupe(allocator, init.patch_fingerprint);
+    errdefer allocator.free(patch_fingerprint);
+    const updated_at = try util.dupe(allocator, init.updated_at);
+    return .{
+        .repository_id = repository_id,
+        .review_target_id = review_target_id,
+        .file_path = file_path,
+        .status = status,
+        .patch_fingerprint = patch_fingerprint,
+        .updated_at = updated_at,
     };
 }
 
@@ -515,8 +639,9 @@ fn jsonInt(item: std.json.Value, key: []const u8, default: u32) u32 {
     if (item != .object) return default;
     const value = item.object.get(key) orelse return default;
     return switch (value) {
-        .integer => |i| if (i < 0) default else @as(u32, @intCast(i)),
-        .float => |f| if (f < 0) default else @as(u32, @intFromFloat(f)),
+        // Clamp out-of-range values from a corrupt store instead of panicking on the cast.
+        .integer => |i| if (i < 0 or i > std.math.maxInt(u32)) default else @intCast(i),
+        .float => |f| if (!(f >= 0 and f <= @as(f64, std.math.maxInt(u32)))) default else @intFromFloat(f),
         else => default,
     };
 }
@@ -542,11 +667,18 @@ fn atomicWrite(allocator: std.mem.Allocator, io: std.Io, path: []const u8, bytes
     const now_ms = @divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms);
     const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, now_ms });
     defer allocator.free(tmp);
-    var file = std.Io.Dir.createFileAbsolute(io, tmp, .{ .truncate = true }) catch return error.StorageWriteFailed;
+    // Use cwd-relative file/rename APIs (rather than the *Absolute variants, which assert an
+    // absolute path) so a relative state path — e.g. when HOME and XDG_STATE_HOME are both
+    // unset and stateBaseDir falls back to "." — fails gracefully instead of panicking.
+    const cwd = std.Io.Dir.cwd();
+    var file = cwd.createFile(io, tmp, .{ .truncate = true }) catch return error.StorageWriteFailed;
+    // Remove the temp file if writing/renaming fails, so a full or read-only volume does not
+    // accumulate .tmp.<ms> litter.
+    errdefer cwd.deleteFile(io, tmp) catch {};
     defer file.close(io);
     file.writeStreamingAll(io, bytes) catch return error.StorageWriteFailed;
     file.sync(io) catch return error.StorageWriteFailed;
-    std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.StorageWriteFailed;
+    cwd.rename(tmp, cwd, path, io) catch return error.StorageWriteFailed;
 }
 
 test "state invalidates by patch fingerprint" {
@@ -715,6 +847,46 @@ test "removing all comments respects file filter across targets" {
 
     try std.testing.expectEqual(@as(usize, 2), try store.removeAllComments(null));
     try std.testing.expectEqual(@as(usize, 0), store.comments.len);
+}
+
+test "buildComment frees every field on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var comment = try buildComment(allocator, .{
+                .comment_id = "cmt_x",
+                .repository_id = "repo",
+                .review_target_id = "target",
+                .file_path = "src/a.zig",
+                .side = "new",
+                .start_line = 3,
+                .end_line = 3,
+                .stable_line_id = "line_x",
+                .hunk_header = "@@ -1 +1 @@",
+                .patch_fingerprint = "sha256:x",
+                .body = "a comment body",
+                .author = "tester",
+                .created_at = "2026-01-01T00:00:00Z",
+                .updated_at = "2026-01-01T00:00:00Z",
+            });
+            comment.deinit(allocator);
+        }
+    }.run, .{});
+}
+
+test "makeReviewState frees every field on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var state = try makeReviewState(allocator, .{
+                .repository_id = "repo",
+                .review_target_id = "target",
+                .file_path = "src/a.zig",
+                .status = "reviewed",
+                .patch_fingerprint = "sha256:x",
+                .updated_at = "2026-01-01T00:00:00Z",
+            });
+            state.deinit(allocator);
+        }
+    }.run, .{});
 }
 
 fn testComment(allocator: std.mem.Allocator, id: []const u8, target_id: []const u8, file_path: []const u8, status: MatchStatus) !Comment {

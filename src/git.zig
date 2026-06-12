@@ -7,6 +7,7 @@ const full_context_arg = "--unified=1000000";
 pub const GitError = error{
     NotGitRepository,
     GitCommandFailed,
+    DiffTooLarge,
 } || std.mem.Allocator.Error || diff.ParseError;
 
 pub const FileSide = enum {
@@ -42,7 +43,11 @@ pub const GitRunner = struct {
             .argv = argv.items,
             .stdout_limit = .limited(200 * 1024 * 1024),
             .stderr_limit = .limited(20 * 1024 * 1024),
-        }) catch return error.GitCommandFailed;
+        }) catch |err| switch (err) {
+            // Distinguish an over-200MB diff from a real git failure so callers can report it.
+            error.StreamTooLong => return error.DiffTooLarge,
+            else => return error.GitCommandFailed,
+        };
 
         switch (result.term) {
             .exited => |code| if (code != 0) {
@@ -212,7 +217,10 @@ fn appendUntrackedPatch(
             try appendBinaryUntrackedPatch(allocator, patches, path);
             return;
         },
-        else => return error.GitCommandFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+        // A single unreadable untracked entry (broken symlink, no read permission, a directory
+        // returned by ls-files, ...) must not abort the whole snapshot; skip just this file.
+        else => return,
     };
     defer allocator.free(content);
 
@@ -292,46 +300,52 @@ fn appendPatch(
     }
 }
 
-fn mergeOrAppendFile(allocator: std.mem.Allocator, files: *std.ArrayList(diff.DiffFile), incoming: diff.DiffFile) !void {
+fn mergeOrAppendFile(allocator: std.mem.Allocator, files: *std.ArrayList(diff.DiffFile), incoming_file: diff.DiffFile) !void {
+    var incoming = incoming_file;
+    // This function takes ownership of `incoming`: free it if anything below fails before it
+    // is merged into an existing file or appended to the list.
+    errdefer incoming.deinit(allocator);
+
     for (files.items) |*existing| {
         if (util.eql(existing.path, incoming.path)) {
+            // Build every merged buffer before mutating `existing` (commit-last), so an OOM
+            // partway through neither half-updates `existing` nor leaks an intermediate.
             const merged_patch = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ existing.patch_text, incoming.patch_text });
+            errdefer allocator.free(merged_patch);
             const merged_hash = try util.hashHex(allocator, merged_patch);
-            const merged_fingerprint = try std.fmt.allocPrint(allocator, "sha256:{s}", .{merged_hash});
+            const merged_fingerprint = std.fmt.allocPrint(allocator, "sha256:{s}", .{merged_hash}) catch |err| {
+                allocator.free(merged_hash);
+                return err;
+            };
             allocator.free(merged_hash);
-            allocator.free(existing.patch_text);
-            allocator.free(existing.patch_fingerprint);
-            existing.patch_text = merged_patch;
-            existing.patch_fingerprint = merged_fingerprint;
-            if (existing.source != incoming.source) existing.source = .explicit;
+            errdefer allocator.free(merged_fingerprint);
 
-            const old_len = existing.hunks.len;
             const merged_hunks = try allocator.alloc(diff.DiffHunk, existing.hunks.len + incoming.hunks.len);
             @memcpy(merged_hunks[0..existing.hunks.len], existing.hunks);
-            @memcpy(merged_hunks[old_len..], incoming.hunks);
-            allocator.free(existing.hunks);
-            existing.hunks = merged_hunks;
+            @memcpy(merged_hunks[existing.hunks.len..], incoming.hunks);
 
+            // Commit: release the superseded buffers and adopt the merged ones.
+            allocator.free(existing.patch_text);
+            allocator.free(existing.patch_fingerprint);
+            allocator.free(existing.hunks);
+            existing.patch_text = merged_patch;
+            existing.patch_fingerprint = merged_fingerprint;
+            existing.hunks = merged_hunks;
+            if (existing.source != incoming.source) existing.source = .explicit;
+
+            // incoming's hunk *elements* were moved into merged_hunks; free everything else we
+            // own on incoming, including the now-moved-out hunks backing array (F16/F27). This
+            // is the success path, so the errdefers above do not run.
             allocator.free(incoming.path);
             if (incoming.old_path) |old| allocator.free(old);
             if (incoming.language) |lang| allocator.free(lang);
             allocator.free(incoming.patch_fingerprint);
             allocator.free(incoming.patch_text);
+            allocator.free(incoming.hunks);
             return;
         }
     }
     try files.append(allocator, incoming);
-}
-
-pub fn statusList(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, target: diff.ReviewTarget, debug: bool) GitError![]u8 {
-    const runner = GitRunner{ .allocator = allocator, .io = io, .repo_root = repo_root, .debug = debug };
-    const args = if (target.kind == .working_tree)
-        &.{ "status", "--short" }
-    else
-        &.{ "diff", "--name-status" };
-    const result = try runner.run(args);
-    allocator.free(result.stderr);
-    return result.stdout;
 }
 
 pub fn loadFileSide(

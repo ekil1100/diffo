@@ -25,10 +25,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) C
     if (args.len > 0 and util.eql(args[0], "themes")) return themesCommand(allocator, io, args[1..]);
 
     var target = try diff.makeReviewTarget(allocator, args);
-    errdefer target.deinit(allocator);
+    var target_owned = true;
+    errdefer if (target_owned) target.deinit(allocator);
     var repo = try git.discoverRepository(allocator, io, debug_git);
-    errdefer repo.deinit(allocator);
+    var repo_owned = true;
+    errdefer if (repo_owned) repo.deinit(allocator);
     var snapshot = try git.loadSnapshot(allocator, io, repo, target, debug_git);
+    // loadSnapshot took ownership of repo and target (shallow copies share the same heap
+    // pointers); snapshot.deinit now frees them, so disarm the per-value errdefers to avoid a
+    // double free if Store.init / defaultAuthor / tui.run fails below.
+    target_owned = false;
+    repo_owned = false;
     defer snapshot.deinit(allocator);
     var store = try store_mod.Store.init(allocator, io, snapshot.repository.repo_id);
     defer store.deinit();
@@ -219,10 +226,16 @@ const Context = struct {
 
 fn loadDefaultContext(allocator: std.mem.Allocator, io: std.Io, debug_git: bool) CliError!Context {
     var target = try diff.makeReviewTarget(allocator, &.{});
-    errdefer target.deinit(allocator);
+    var target_owned = true;
+    errdefer if (target_owned) target.deinit(allocator);
     var repo = try git.discoverRepository(allocator, io, debug_git);
-    errdefer repo.deinit(allocator);
+    var repo_owned = true;
+    errdefer if (repo_owned) repo.deinit(allocator);
     var snapshot = try git.loadSnapshot(allocator, io, repo, target, debug_git);
+    // snapshot owns repo and target now; a single snapshot.deinit covers them, so on a
+    // Store.init failure only that errdefer must run (not the per-value ones).
+    target_owned = false;
+    repo_owned = false;
     errdefer snapshot.deinit(allocator);
     const store = try store_mod.Store.init(allocator, io, snapshot.repository.repo_id);
     return .{ .snapshot = snapshot, .store = store };
@@ -253,7 +266,9 @@ fn printCommentsJson(allocator: std.mem.Allocator, io: std.Io, snapshot: diff.Di
     try out.appendSlice(allocator, "{\n  \"schema_version\": 1,\n  \"repository_id\": ");
     try util.writeJsonString(&out, allocator, snapshot.repository.repo_id);
     try out.appendSlice(allocator, ",\n  \"review_target_id\": ");
-    try appendOptionalJsonString(allocator, &out, target_filter);
+    // Emit the snapshot's actual review target at the top level; target_filter only narrows
+    // which comments are listed (and is null for the default `comments list --json`).
+    try util.writeJsonString(&out, allocator, snapshot.review_target.target_id);
     try out.appendSlice(allocator, ",\n  \"comments\": [\n");
     var emitted: usize = 0;
     for (store.comments) |comment| {

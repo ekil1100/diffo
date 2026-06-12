@@ -25,24 +25,6 @@ pub const HighlightSpan = struct {
     token: SyntaxToken,
 };
 
-pub const Config = struct {
-    enabled: bool = true,
-    tree_sitter_ast_enabled: bool = true,
-    max_file_size: usize = 512 * 1024,
-};
-
-pub const RegistryStatus = struct {
-    mode: HighlightMode,
-    detail: []const u8,
-};
-
-pub fn registryStatus() RegistryStatus {
-    return .{
-        .mode = .tree_sitter,
-        .detail = "Tree-sitter syntax highlighting is available for bundled Zig, TS, TSX, JS, Rust, C, C++, and Python grammars.",
-    };
-}
-
 pub fn modeForLanguage(language: ?[]const u8) HighlightMode {
     const lang = language orelse return .disabled;
     return if (syntax_grammars.find(lang) != null) .tree_sitter else .disabled;
@@ -57,14 +39,13 @@ pub fn renderHighlightedLine(
 ) ![]u8 {
     if (!ansi.enabled or spans.len == 0) return util.dupe(allocator, text);
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     var cursor: usize = 0;
     for (spans) |span| {
         if (span.end_byte <= cursor or span.start_byte >= text.len or span.end_byte > text.len or span.start_byte >= span.end_byte) continue;
         const start = @max(cursor, span.start_byte);
         if (cursor < start) try out.appendSlice(allocator, text[cursor..start]);
-        const color = try ansi.fg(allocator, colorForToken(tokens, span.token));
-        defer allocator.free(color);
-        try out.appendSlice(allocator, color);
+        try ansi.appendFg(allocator, &out, colorForToken(tokens, span.token));
         try out.appendSlice(allocator, text[start..span.end_byte]);
         try out.appendSlice(allocator, ansi.reset());
         cursor = span.end_byte;
@@ -84,10 +65,6 @@ fn colorForToken(tokens: theme.ThemeTokens, token: SyntaxToken) theme.Color {
         .operator => tokens.syntax_operator,
         .plain => tokens.syntax_plain,
     };
-}
-
-test "registry reports bundled tree-sitter grammars" {
-    try std.testing.expectEqual(HighlightMode.tree_sitter, registryStatus().mode);
 }
 
 test "language mode reports disabled for unsupported languages" {

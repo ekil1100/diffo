@@ -159,19 +159,23 @@ pub fn run(
     var signals = SignalCleanup.install();
     defer signals.restore();
 
-    try writeAll(io, enter_tui_screen);
+    // Mark the signal handler active and register the screen-restore defer BEFORE writing the
+    // enter-screen sequence, so a partial or failed setup write still gets cleaned up rather
+    // than leaving the terminal on the alt-screen with the cursor hidden and mouse tracking on.
     SignalCleanup.active = true;
     defer {
         writeAll(io, leave_tui_screen) catch {};
         SignalCleanup.active = false;
     }
+    try writeAll(io, enter_tui_screen);
 
+    var event_buf: [64]u8 = undefined;
     while (true) {
         const screen = try render(allocator, snapshot.*, store.*, &state, true);
         defer allocator.free(screen);
         try writeAll(io, screen);
 
-        const event = readEvent() orelse continue;
+        const event = readEvent(&event_buf) orelse continue;
         if (try handleEvent(allocator, io, snapshot, store, author, &state, event)) break;
     }
 }
@@ -254,6 +258,9 @@ fn handleEvent(
                 'Z' => try toggleAllFolds(allocator, snapshot.*, state),
                 'C' => try toggleFoldMode(allocator, snapshot.*, state),
                 'v' => {
+                    // Row indices change between stacked and split, so a stale selection anchor
+                    // would highlight (and copy/comment) the wrong range — clear it.
+                    state.selection_start = null;
                     state.mode = if (state.mode == .stacked) .split else .stacked;
                     clampCursor(allocator, snapshot.*, state) catch {};
                 },
@@ -357,6 +364,7 @@ fn render(
     ensureRenderViewport(snapshot, view, state, layout);
 
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     if (colors) try out.appendSlice(allocator, "\x1b[?2026h\x1b[H");
     try appendStatus(allocator, &out, snapshot, store, state, layout.width);
     try out.appendSlice(allocator, clear_eol);
@@ -375,11 +383,11 @@ fn render(
 
     for (0..layout.body_height) |i| {
         const left = if (i < diff_lines.len) diff_lines[i] else "";
-        try appendRenderedCell(allocator, &out, left, layout.main_width);
+        try appendRenderedCell(allocator, &out, left, layout.main_width, ansi, palette.bg_default);
         if (layout.sidebar_width > 0) {
             try out.appendSlice(allocator, "│");
             const right = if (i < tree_lines.len) tree_lines[i] else "";
-            try appendRenderedCell(allocator, &out, right, layout.sidebar_width);
+            try appendRenderedCell(allocator, &out, right, layout.sidebar_width, ansi, palette.bg_default);
         }
         try out.appendSlice(allocator, clear_eol);
         try out.append(allocator, '\n');
@@ -389,15 +397,17 @@ fn render(
         try tui_text.appendCell(allocator, &out, "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/p change  C unfold/fold  z/Z folds  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit", layout.width);
     } else {
         const active_file = snapshot.files[state.active_file];
-        const syntax_mode = activeSyntaxMode(snapshot, active_file);
+        const syntax_mode = activeSyntaxMode(active_file);
+        const middle = try std.fmt.allocPrint(allocator, "mode={s}/{s} target={s} syntax={s}", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) });
+        defer allocator.free(middle);
         const footer = switch (state.copy_notice) {
-            .none => try std.fmt.allocPrint(allocator, "mode={s}/{s} target={s} syntax={s}  ? help  C unfold/fold  z/Z folds  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  mode={s}/{s} target={s} syntax={s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .copied_tmux => |line_count| try std.fmt.allocPrint(allocator, "{d} line{s} saved to tmux buffer — Ctrl+b ] to paste  mode={s}/{s} target={s} syntax={s}  install xclip/wl-copy for system clipboard", .{ line_count, if (line_count == 1) "" else "s", state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .unavailable => try std.fmt.allocPrint(allocator, "clipboard unavailable  mode={s}/{s} target={s} syntax={s}  install xclip/wl-copy or enable OSC 52", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .comment_added => try std.fmt.allocPrint(allocator, "comment added  mode={s}/{s} target={s} syntax={s}  c comment  q quit", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
-            .comment_not_added => try std.fmt.allocPrint(allocator, "no diff line in current file  mode={s}/{s} target={s} syntax={s}  c comment", .{ state.mode.label(), state.fold_mode.label(), snapshot.review_target.normalized_spec, @tagName(syntax_mode) }),
+            .none => try std.fmt.allocPrint(allocator, "{s}  ? help  C unfold/fold  z/Z folds  q quit", .{middle}),
+            .empty => try std.fmt.allocPrint(allocator, "nothing copyable at cursor  {s}  V select  y copy", .{middle}),
+            .copied => |line_count| try std.fmt.allocPrint(allocator, "copied {d} line{s} to clipboard  {s}  V select  y copy", .{ line_count, if (line_count == 1) "" else "s", middle }),
+            .copied_tmux => |line_count| try std.fmt.allocPrint(allocator, "{d} line{s} saved to tmux buffer — Ctrl+b ] to paste  {s}  install xclip/wl-copy for system clipboard", .{ line_count, if (line_count == 1) "" else "s", middle }),
+            .unavailable => try std.fmt.allocPrint(allocator, "clipboard unavailable  {s}  install xclip/wl-copy or enable OSC 52", .{middle}),
+            .comment_added => try std.fmt.allocPrint(allocator, "comment added  {s}  c comment  q quit", .{middle}),
+            .comment_not_added => try std.fmt.allocPrint(allocator, "no diff line in current file  {s}  c comment", .{middle}),
         };
         defer allocator.free(footer);
         try tui_text.appendCell(allocator, &out, footer, layout.width);
@@ -417,8 +427,7 @@ fn appendStatus(allocator: std.mem.Allocator, out: *std.ArrayList(u8), snapshot:
     try tui_text.appendCell(allocator, out, line, width);
 }
 
-fn activeSyntaxMode(snapshot: diff.DiffSnapshot, file: diff.DiffFile) syntax.HighlightMode {
-    _ = snapshot;
+fn activeSyntaxMode(file: diff.DiffFile) syntax.HighlightMode {
     if (file.is_binary) return .disabled;
     return syntax.modeForLanguage(file.language);
 }
@@ -436,15 +445,24 @@ test "syntax mode follows language for explicit targets" {
         .patch_fingerprint = @constCast("fingerprint"),
         .patch_text = @constCast("patch"),
     };
-    try std.testing.expectEqual(syntax.HighlightMode.tree_sitter, activeSyntaxMode(undefined, file));
+    try std.testing.expectEqual(syntax.HighlightMode.tree_sitter, activeSyntaxMode(file));
 
     file.is_binary = true;
-    try std.testing.expectEqual(syntax.HighlightMode.disabled, activeSyntaxMode(undefined, file));
+    try std.testing.expectEqual(syntax.HighlightMode.disabled, activeSyntaxMode(file));
 }
 
-fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
+fn appendRenderedCell(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize, ansi: theme.Ansi, bg: theme.Color) !void {
     if (text.len == 0) {
-        for (0..width) |_| try out.append(allocator, ' ');
+        // Filler row below a short diff/tree: paint the theme background so the empty area does
+        // not fall back to the terminal default colour. Non-truecolor mode just emits spaces.
+        if (ansi.true_color) {
+            var buf: [24]u8 = undefined;
+            try out.appendSlice(allocator, ansi.bgInto(&buf, bg));
+            for (0..width) |_| try out.append(allocator, ' ');
+            try out.appendSlice(allocator, ansi.reset());
+        } else {
+            for (0..width) |_| try out.append(allocator, ' ');
+        }
         return;
     }
     try out.appendSlice(allocator, text);
@@ -608,6 +626,13 @@ fn oneRenderedLine(allocator: std.mem.Allocator, line: []u8) ![][]u8 {
     return lines;
 }
 
+fn displayPath(allocator: std.mem.Allocator, file: diff.DiffFile) ![]u8 {
+    if (file.old_path) |old| {
+        if (!util.eql(old, file.path)) return std.fmt.allocPrint(allocator, "{s} -> {s}", .{ old, file.path });
+    }
+    return util.dupe(allocator, file.path);
+}
+
 fn renderFileHeader(
     allocator: std.mem.Allocator,
     file: diff.DiffFile,
@@ -616,10 +641,7 @@ fn renderFileHeader(
     ansi: theme.Ansi,
     palette: theme.ThemeTokens,
 ) ![]u8 {
-    const path = if (file.old_path) |old|
-        if (util.eql(old, file.path)) try util.dupe(allocator, file.path) else try std.fmt.allocPrint(allocator, "{s} -> {s}", .{ old, file.path })
-    else
-        try util.dupe(allocator, file.path);
+    const path = try displayPath(allocator, file);
     defer allocator.free(path);
     const stats = try fileStats(allocator, view.deletions, view.additions);
     defer allocator.free(stats);
@@ -667,25 +689,6 @@ fn renderFoldRow(
     const text = try std.fmt.allocPrint(allocator, " {s}  {d} {s}", .{ caret, row.fold_line_count, label });
     defer allocator.free(text);
     return styleCell(allocator, text, width, ansi, if (selected) palette.bg_selected else palette.bg_panel, palette.fg_muted);
-}
-
-fn renderStackedCodeRow(
-    allocator: std.mem.Allocator,
-    state: *State,
-    file: diff.DiffFile,
-    file_index: usize,
-    store: store_mod.Store,
-    target_id: []const u8,
-    line: *const diff.DiffLine,
-    width: usize,
-    line_width: usize,
-    selected: bool,
-    ansi: theme.Ansi,
-    palette: theme.ThemeTokens,
-) ![]u8 {
-    const rows = try renderStackedCodeRows(allocator, state, file, file_index, store, target_id, line, width, line_width, selected, 1, ansi, palette);
-    defer allocator.free(rows);
-    return rows[0];
 }
 
 fn renderStackedCodeRows(
@@ -894,56 +897,99 @@ fn wrapAnsiTextWithWidths(
     return lines.toOwnedSlice(allocator);
 }
 
-// Must stay in sync with wrapAnsiTextWithWidths — same wrapping algorithm.
+// Unbounded line count for the wrap produced by wrapAnsiTextWithWidths. This mirrors that
+// function's break logic exactly — tracking byte lengths and visible widths instead of
+// allocating line buffers — so visualRowHeight can never disagree with the renderer about how
+// many rows a line occupies. The "wrap line count matches rendered line count" fuzz test guards
+// the equivalence; keep the two in sync (change both, or neither).
 fn wrapAnsiTextLineCount(text: []const u8, first_width: usize, continuation_width: usize) usize {
-    if (first_width == 0 and continuation_width == 0) return 1;
-    if (text.len == 0) return 1;
-    var line_count: usize = 1;
+    var completed: usize = 0; // mirrors lines.items.len
+    var cur_len: usize = 0; // mirrors current.items.len (bytes)
     var visible: usize = 0;
     var seen_non_space = false;
-    var break_visible_start: usize = 0;
-    var has_break = false;
+    var previous_was_space = false;
+    var last_break: ?struct {
+        line_end: usize,
+        carry_start: usize,
+        carry_visible_start: usize,
+    } = null;
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == '\x1b') {
+            const start = i;
             i += 1;
             while (i < text.len and text[i] != 'm') : (i += 1) {}
-            i += 1;
+            if (i < text.len) i += 1;
+            cur_len += i - start;
             continue;
         }
+
         const seq_len = tui_text.utf8SeqLen(text[i]);
         if (i + seq_len > text.len) break;
         const char_width = @max(tui_text.displayWidth(text[i .. i + seq_len]), 1);
-        const current_width = if (line_count == 1) first_width else continuation_width;
+        const current_width = if (completed == 0) first_width else continuation_width;
         if (visible > 0 and visible + char_width > current_width) {
-            if (has_break) {
-                visible = visible - break_visible_start;
-            } else {
-                visible = 0;
+            if (last_break) |breakpoint| {
+                if (breakpoint.line_end > 0) {
+                    completed += 1;
+                    cur_len -= breakpoint.carry_start;
+                    visible -= breakpoint.carry_visible_start;
+                    seen_non_space = visible > 0;
+                    previous_was_space = false;
+                    last_break = null;
+                    continue;
+                }
             }
-            line_count += 1;
+            completed += 1;
+            cur_len = 0;
+            visible = 0;
             seen_non_space = false;
-            has_break = false;
-            // re-process the same character on the new line
+            previous_was_space = false;
+            last_break = null;
             continue;
         }
+        cur_len += seq_len;
         visible += char_width;
         const is_space = seq_len == 1 and text[i] == ' ';
         if (is_space) {
             if (seen_non_space) {
-                break_visible_start = visible;
-                has_break = true;
+                const line_end = if (previous_was_space) last_break.?.line_end else cur_len - seq_len;
+                last_break = .{ .line_end = line_end, .carry_start = cur_len, .carry_visible_start = visible };
             }
+            previous_was_space = true;
         } else if (char_width > 0) {
             seen_non_space = true;
+            previous_was_space = false;
         }
         if (!is_space and seen_non_space and isCodeBreakAfterChar(text[i .. i + seq_len])) {
-            break_visible_start = visible;
-            has_break = true;
+            last_break = .{ .line_end = cur_len, .carry_start = cur_len, .carry_visible_start = visible };
         }
         i += seq_len;
     }
-    return line_count;
+    if (cur_len > 0 or completed == 0) completed += 1;
+    return completed;
+}
+
+test "wrap line count matches rendered line count" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    const random = prng.random();
+    const alphabet = "ab cd,;=){}\x1bm \t.";
+    var round: usize = 0;
+    while (round < 3000) : (round += 1) {
+        var buf: [80]u8 = undefined;
+        const len = random.uintLessThan(usize, buf.len);
+        for (buf[0..len]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        const text = buf[0..len];
+        const first_width = 3 + random.uintLessThan(usize, 24);
+        const cont_width = 3 + random.uintLessThan(usize, 24);
+        const rows = try wrapAnsiTextWithWidths(allocator, text, first_width, cont_width, 100000);
+        defer {
+            for (rows) |row| allocator.free(row);
+            allocator.free(rows);
+        }
+        try std.testing.expectEqual(rows.len, wrapAnsiTextLineCount(text, first_width, cont_width));
+    }
 }
 
 fn isCodeBreakAfterChar(bytes: []const u8) bool {
@@ -951,25 +997,6 @@ fn isCodeBreakAfterChar(bytes: []const u8) bool {
         ',', ';', ':', '=', ')', ']', '}', '{' => true,
         else => false,
     };
-}
-
-fn renderSplitCodeRow(
-    allocator: std.mem.Allocator,
-    state: *State,
-    file: diff.DiffFile,
-    file_index: usize,
-    store: store_mod.Store,
-    target_id: []const u8,
-    row: tui_view.VisualRow,
-    width: usize,
-    line_width: usize,
-    selected: bool,
-    ansi: theme.Ansi,
-    palette: theme.ThemeTokens,
-) ![]u8 {
-    const rows = try renderSplitCodeRows(allocator, state, file, file_index, store, target_id, row, width, line_width, selected, 1, ansi, palette);
-    defer allocator.free(rows);
-    return rows[0];
 }
 
 fn renderSplitCodeRows(
@@ -1037,25 +1064,6 @@ fn renderSplitCodeRows(
     return rows.toOwnedSlice(allocator);
 }
 
-fn renderSplitCell(
-    allocator: std.mem.Allocator,
-    state: *State,
-    file: diff.DiffFile,
-    file_index: usize,
-    store: store_mod.Store,
-    target_id: []const u8,
-    maybe_line: ?*const diff.DiffLine,
-    width: usize,
-    line_width: usize,
-    selected: bool,
-    ansi: theme.Ansi,
-    palette: theme.ThemeTokens,
-) ![]u8 {
-    const rows = try renderSplitCellRows(allocator, state, file, file_index, store, target_id, maybe_line, width, line_width, selected, 1, &.{}, ansi, palette);
-    defer allocator.free(rows);
-    return rows[0];
-}
-
 fn renderSplitCellRows(
     allocator: std.mem.Allocator,
     state: *State,
@@ -1116,10 +1124,10 @@ fn styleCell(
 ) ![]u8 {
     const fitted = try tui_text.fitCell(allocator, text, width);
     defer allocator.free(fitted);
-    const bg_code = try ansi.bg(allocator, bg);
-    defer allocator.free(bg_code);
-    const fg_code = try ansi.fg(allocator, fg);
-    defer allocator.free(fg_code);
+    var bg_buf: [24]u8 = undefined;
+    var fg_buf: [24]u8 = undefined;
+    const bg_code = ansi.bgInto(&bg_buf, bg);
+    const fg_code = ansi.fgInto(&fg_buf, fg);
     const styled = try reapplyStyleAfterResets(allocator, fitted, bg_code, fg_code, ansi.reset());
     defer allocator.free(styled);
     return std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ bg_code, fg_code, styled, ansi.reset() });
@@ -1134,6 +1142,7 @@ fn reapplyStyleAfterResets(
 ) ![]u8 {
     if (reset.len == 0) return util.dupe(allocator, text);
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < text.len) {
         if (std.mem.startsWith(u8, text[i..], reset)) {
@@ -1191,10 +1200,10 @@ fn applyInlineRanges(
 ) ![]u8 {
     if (ranges.len == 0 or !ansi.enabled or !ansi.true_color) return util.dupe(allocator, highlighted);
 
-    const base_bg_code = try ansi.bg(allocator, base_bg);
-    defer allocator.free(base_bg_code);
-    const inline_bg_code = try ansi.bg(allocator, inline_bg);
-    defer allocator.free(inline_bg_code);
+    var base_buf: [24]u8 = undefined;
+    var inline_buf: [24]u8 = undefined;
+    const base_bg_code = ansi.bgInto(&base_buf, base_bg);
+    const inline_bg_code = ansi.bgInto(&inline_buf, inline_bg);
     if (inline_bg_code.len == 0) return util.dupe(allocator, highlighted);
 
     var out: std.ArrayList(u8) = .empty;
@@ -1420,10 +1429,7 @@ fn appendCopyRow(
 fn copyFileHeader(allocator: std.mem.Allocator, file: diff.DiffFile, view: tui_view.FileView) ![]u8 {
     const stats = try fileStats(allocator, view.deletions, view.additions);
     defer allocator.free(stats);
-    const path = if (file.old_path) |old|
-        if (util.eql(old, file.path)) try util.dupe(allocator, file.path) else try std.fmt.allocPrint(allocator, "{s} -> {s}", .{ old, file.path })
-    else
-        try util.dupe(allocator, file.path);
+    const path = try displayPath(allocator, file);
     defer allocator.free(path);
     if (stats.len == 0) return util.dupe(allocator, path);
     return std.fmt.allocPrint(allocator, "{s} ({s})", .{ path, stats });
@@ -1496,8 +1502,8 @@ fn writeToClipboard(allocator: std.mem.Allocator, io: std.Io, text: []const u8) 
 
 fn trySystemClipboard(io: std.Io, text: []const u8) bool {
     const candidates = [_][]const []const u8{
-        &.{ "wl-copy" },
-        &.{ "pbcopy" },
+        &.{"wl-copy"},
+        &.{"pbcopy"},
         &.{ "xclip", "-selection", "clipboard" },
         &.{ "xsel", "--clipboard", "--input" },
     };
@@ -1970,10 +1976,16 @@ fn fillViewportAtBottom(
     layout: Layout,
 ) void {
     if (view.rows.len == 0 or state.scroll_row >= view.rows.len) return;
-    var height = visualHeightBetween(snapshot, state, view, state.scroll_row, view.rows.len, layout);
+    const file = snapshot.files[state.active_file];
+    // We only need to know whether rows from scroll_row already fill the viewport, so stop
+    // summing as soon as we reach body_height instead of walking to EOF on every frame.
+    var height: usize = 0;
+    var row = state.scroll_row;
+    while (row < view.rows.len and height < layout.body_height) : (row += 1) {
+        height += visualRowHeight(state, file, view.rows[row], layout);
+    }
     while (state.scroll_row > 0 and height < layout.body_height) {
         const prev = state.scroll_row - 1;
-        const file = snapshot.files[state.active_file];
         const prev_height = visualRowHeight(state, file, view.rows[prev], layout);
         if (height + prev_height > layout.body_height) break;
         state.scroll_row = prev;
@@ -2138,6 +2150,9 @@ fn toggleCurrentFoldInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSn
     const target = findFoldTarget(view, state.cursor_row) orelse return;
     const cursor_anchor = captureFoldToggleAnchor(snapshot, state, view, target, layout);
     const id = view.rows[target].fold_id orelse return;
+    // Toggling rebuilds row indices, so a stale selection anchor would highlight (and
+    // copy/comment) the wrong range — clear it alongside the mutation.
+    state.selection_start = null;
     try toggleFold(state, allocator, id);
     var updated = try currentView(allocator, snapshot, state);
     defer updated.deinit(allocator);
@@ -2181,6 +2196,8 @@ fn toggleAllFoldsInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
             break;
         }
     }
+    // Fold changes rebuild row indices; invalidate the selection anchor with them.
+    state.selection_start = null;
     for (view.rows) |row| {
         if (row.kind == .fold) {
             try setFold(state, allocator, row.fold_id.?, if (should_expand) .expanded else .collapsed);
@@ -2202,6 +2219,8 @@ fn toggleFoldModeInLayout(allocator: std.mem.Allocator, snapshot: diff.DiffSnaps
     const target = findFoldTarget(view, state.cursor_row);
     const cursor_anchor = captureFoldToggleAnchor(snapshot, state, view, target, layout);
 
+    // The fold-mode flip rebuilds row indices; invalidate the selection anchor with it.
+    state.selection_start = null;
     state.fold_mode = if (state.fold_mode == .unfold) .fold else .unfold;
     if (state.fold_mode == .fold) state.folds.clearRetainingCapacity();
 
@@ -2317,9 +2336,11 @@ fn commentAnchorForRow(file: diff.DiffFile, row: tui_view.VisualRow) ?CommentAnc
     };
 }
 
-fn readEvent() ?Event {
-    var buf: [64]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return null;
+fn readEvent(buf: *[64]u8) ?Event {
+    // The returned Event.key/.mouse borrow `buf`, which is owned by the caller's frame (run's
+    // loop), so the slice stays valid until the event is handled — unlike a function-local
+    // buffer, whose slice would dangle after readEvent returns.
+    const n = std.posix.read(std.posix.STDIN_FILENO, buf) catch return null;
     if (n == 0) return null;
     const bytes = buf[0..n];
     if (parseSgrMouse(bytes)) |mouse| return .{ .mouse = mouse };
@@ -3066,6 +3087,9 @@ const SignalCleanup = struct {
     previous_term: ?std.posix.Sigaction = null,
 
     var active: bool = false;
+    // Cooked-mode termios captured by RawTerminal.enter, so the signal handler can restore the
+    // terminal to a sane line discipline (not just screen modes) before exiting.
+    var saved_termios: ?std.posix.termios = null;
 
     fn install() SignalCleanup {
         if (builtin.os.tag != .linux) return .{};
@@ -3090,6 +3114,7 @@ const SignalCleanup = struct {
     }
 
     fn handleSignal(signal: std.posix.SIG) callconv(.c) void {
+        if (saved_termios) |termios| std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, termios) catch {};
         if (active) {
             _ = std.os.linux.write(std.posix.STDOUT_FILENO, disable_extended_keyboard.ptr, disable_extended_keyboard.len);
             _ = std.os.linux.write(std.posix.STDOUT_FILENO, leave_tui_screen.ptr, leave_tui_screen.len);
@@ -3116,11 +3141,13 @@ const RawTerminal = struct {
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        SignalCleanup.saved_termios = original;
         return .{ .original = original };
     }
 
     fn restore(self: *RawTerminal) void {
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        SignalCleanup.saved_termios = null;
     }
 };
 

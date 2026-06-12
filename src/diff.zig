@@ -194,6 +194,10 @@ pub fn makeReviewTarget(allocator: std.mem.Allocator, args: []const []const u8) 
 
 pub fn parsePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffSource) ![]DiffFile {
     var files: std.ArrayList(DiffFile) = .empty;
+    errdefer {
+        for (files.items) |*file| file.deinit(allocator);
+        files.deinit(allocator);
+    }
     var pos: usize = 0;
     while (pos < patch.len) {
         const start_rel = findDiffStart(patch[pos..]) orelse break;
@@ -202,8 +206,13 @@ pub fn parsePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
         const end = if (next_rel) |rel| start + 1 + rel else patch.len;
         const section = std.mem.trim(u8, patch[start..end], "\n");
         if (section.len > 0) {
-            const file = try parseFilePatch(allocator, section, source);
-            try files.append(allocator, file);
+            var file = try parseFilePatch(allocator, section, source);
+            // The function-level errdefer only frees files already in the list; free this
+            // freshly-parsed file ourselves if the append fails so it does not leak.
+            files.append(allocator, file) catch |err| {
+                file.deinit(allocator);
+                return err;
+            };
         }
         pos = end;
     }
@@ -218,6 +227,15 @@ fn findDiffStart(bytes: []const u8) ?usize {
 
 fn findNextDiffStart(bytes: []const u8) ?usize {
     return findDiffStart(bytes);
+}
+
+/// Replace `slot` with a copy of `value`, freeing the previous string. Dupe before freeing:
+/// if the dupe OOMs, the slot keeps its valid pointer so the caller's errdefer frees it
+/// exactly once (rather than double-freeing a dangling pointer).
+fn replaceString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
+    const dup = try util.dupe(allocator, value);
+    if (slot.*) |old| allocator.free(old);
+    slot.* = dup;
 }
 
 fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffSource) ParseError!DiffFile {
@@ -260,38 +278,39 @@ fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
             status = .deleted;
         } else if (util.startsWith(line, "rename from ")) {
             status = .renamed;
-            if (old_path) |old| allocator.free(old);
-            old_path = try util.dupe(allocator, line["rename from ".len..]);
+            try replaceString(allocator, &old_path, line["rename from ".len..]);
         } else if (util.startsWith(line, "copy from ")) {
             status = .copied;
-            if (old_path) |old| allocator.free(old);
-            old_path = try util.dupe(allocator, line["copy from ".len..]);
+            try replaceString(allocator, &old_path, line["copy from ".len..]);
         } else if (util.startsWith(line, "rename to ")) {
             status = .renamed;
-            if (path) |p| allocator.free(p);
-            path = try util.dupe(allocator, line["rename to ".len..]);
+            try replaceString(allocator, &path, line["rename to ".len..]);
         } else if (util.startsWith(line, "copy to ")) {
             status = .copied;
-            if (path) |p| allocator.free(p);
-            path = try util.dupe(allocator, line["copy to ".len..]);
+            try replaceString(allocator, &path, line["copy to ".len..]);
         } else if (util.startsWith(line, "Binary files ") or util.startsWith(line, "GIT binary patch")) {
             status = .binary;
             is_binary = true;
-        } else if (util.startsWith(line, "+++ ")) {
+        } else if (current_header == null and util.startsWith(line, "+++ ")) {
+            // File headers only appear before the first @@. Gating on current_header == null
+            // stops an added line whose content begins with "++ " (diff line "+++ ...") from
+            // being misparsed as a path and silently dropped.
             if (!util.eql(line[4..], "/dev/null")) {
-                const new_path = stripGitPrefix(line[4..]);
-                if (path) |p| allocator.free(p);
-                path = try util.dupe(allocator, new_path);
+                try replaceString(allocator, &path, stripGitPrefix(line[4..]));
             }
-        } else if (util.startsWith(line, "--- ")) {
+        } else if (current_header == null and util.startsWith(line, "--- ")) {
+            // Likewise a deleted line "-- ..." (diff line "--- ...") must stay hunk content.
             if (!util.eql(line[4..], "/dev/null")) {
-                const old = stripGitPrefix(line[4..]);
-                if (old_path) |p| allocator.free(p);
-                old_path = try util.dupe(allocator, old);
+                try replaceString(allocator, &old_path, stripGitPrefix(line[4..]));
             }
         } else if (util.startsWith(line, "@@ ")) {
             if (current_header) |header| {
                 const owned_lines = try current_lines.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_lines) |*l| l.deinit(allocator);
+                    allocator.free(owned_lines);
+                }
+                current_lines = .empty;
                 try hunks.append(allocator, .{
                     .header = header,
                     .old_start = old_start,
@@ -300,7 +319,7 @@ fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
                     .new_count = new_count,
                     .lines = owned_lines,
                 });
-                current_lines = .empty;
+                current_header = null;
             }
             const parsed = parseHunkHeader(line) orelse return error.ParseFailed;
             current_header = try util.dupe(allocator, line);
@@ -326,17 +345,17 @@ fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
             switch (kind) {
                 .add => {
                     new_lineno = new_line;
-                    new_line += 1;
+                    new_line +|= 1;
                 },
                 .delete => {
                     old_lineno = old_line;
-                    old_line += 1;
+                    old_line +|= 1;
                 },
                 .context => {
                     old_lineno = old_line;
                     new_lineno = new_line;
-                    old_line += 1;
-                    new_line += 1;
+                    old_line +|= 1;
+                    new_line +|= 1;
                 },
                 .meta => {},
             }
@@ -349,23 +368,33 @@ fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
             });
             defer allocator.free(line_id_input);
             const id_hash = try util.hashHex(allocator, line_id_input);
-            errdefer allocator.free(id_hash);
-            const stable_id = try std.fmt.allocPrint(allocator, "line_{s}", .{id_hash[0..16]});
+            const stable_id = std.fmt.allocPrint(allocator, "line_{s}", .{id_hash[0..16]}) catch |err| {
+                allocator.free(id_hash);
+                return err;
+            };
             allocator.free(id_hash);
+            errdefer allocator.free(stable_id);
+
+            const line_text = try util.dupe(allocator, text);
+            errdefer allocator.free(line_text);
 
             try current_lines.append(allocator, .{
                 .kind = kind,
                 .old_lineno = old_lineno,
                 .new_lineno = new_lineno,
-                .text = try util.dupe(allocator, text),
+                .text = line_text,
                 .stable_line_id = stable_id,
             });
         }
     }
 
     if (current_header) |header| {
-        current_header = null;
         const owned_lines = try current_lines.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_lines) |*l| l.deinit(allocator);
+            allocator.free(owned_lines);
+        }
+        current_lines = .empty;
         try hunks.append(allocator, .{
             .header = header,
             .old_start = old_start,
@@ -374,16 +403,22 @@ fn parseFilePatch(allocator: std.mem.Allocator, patch: []const u8, source: DiffS
             .new_count = new_count,
             .lines = owned_lines,
         });
-        current_lines = .empty;
+        // Null only after the append succeeds: while it is in flight current_header must stay
+        // set so the function errdefer frees `header` on an append OOM; once hunks owns it,
+        // null it so a later failure does not double-free it.
+        current_header = null;
     }
 
     const final_path = path orelse try util.dupe(allocator, "(unknown)");
     path = null;
+    errdefer allocator.free(final_path);
     const patch_copy = try util.dupe(allocator, patch);
     errdefer allocator.free(patch_copy);
     const fingerprint_hash = try util.hashHex(allocator, patch);
-    errdefer allocator.free(fingerprint_hash);
-    const fingerprint = try std.fmt.allocPrint(allocator, "sha256:{s}", .{fingerprint_hash});
+    const fingerprint = std.fmt.allocPrint(allocator, "sha256:{s}", .{fingerprint_hash}) catch |err| {
+        allocator.free(fingerprint_hash);
+        return err;
+    };
     allocator.free(fingerprint_hash);
     errdefer allocator.free(fingerprint);
     const language = detectLanguage(allocator, final_path) catch null;
@@ -413,10 +448,10 @@ fn parseDiffGitPath(allocator: std.mem.Allocator, line: []const u8) !ParsedPath 
     if (std.mem.indexOf(u8, rest, marker)) |idx| {
         const old_raw = stripGitPrefix(rest[0..idx]);
         const new_raw = stripGitPrefix(rest[idx + 1 ..]);
-        return .{
-            .old_path = try util.dupe(allocator, old_raw),
-            .path = try util.dupe(allocator, new_raw),
-        };
+        const old_dup = try util.dupe(allocator, old_raw);
+        errdefer allocator.free(old_dup);
+        const new_dup = try util.dupe(allocator, new_raw);
+        return .{ .old_path = old_dup, .path = new_dup };
     }
     return .{
         .old_path = null,
@@ -579,6 +614,90 @@ test "parse unified diff file" {
     try std.testing.expectEqual(@as(usize, 1), files[0].hunks.len);
     try std.testing.expectEqual(@as(usize, 4), files[0].hunks[0].lines.len);
     try std.testing.expectEqual(DiffLineKind.add, files[0].hunks[0].lines[2].kind);
+}
+
+test "added line with plus-plus content is not misparsed as a header" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/notes.txt b/notes.txt
+        \\--- a/notes.txt
+        \\+++ b/notes.txt
+        \\@@ -1,1 +1,2 @@
+        \\ keep
+        \\+++ added with plus prefix
+        \\
+    ;
+    const files = try parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqualStrings("notes.txt", files[0].path);
+    try std.testing.expectEqual(@as(usize, 1), files[0].hunks.len);
+    const lines = files[0].hunks[0].lines;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqual(DiffLineKind.add, lines[1].kind);
+    try std.testing.expectEqualStrings("++ added with plus prefix", lines[1].text);
+}
+
+test "malformed later hunk header fails without double free" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/x b/x
+        \\--- a/x
+        \\+++ b/x
+        \\@@ -1,1 +1,1 @@
+        \\ a
+        \\@@ bogus header @@
+        \\
+    ;
+    try std.testing.expectError(error.ParseFailed, parsePatch(allocator, patch, .explicit));
+}
+
+test "hunk start near u32 max does not overflow line counters" {
+    const allocator = std.testing.allocator;
+    const patch =
+        \\diff --git a/x b/x
+        \\--- a/x
+        \\+++ b/x
+        \\@@ -4294967295,2 +4294967295,2 @@
+        \\ a
+        \\ b
+        \\
+    ;
+    const files = try parsePatch(allocator, patch, .explicit);
+    defer {
+        for (files) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqual(@as(usize, 2), files[0].hunks[0].lines.len);
+}
+
+test "parsePatch frees everything on every allocation failure" {
+    const patch =
+        \\diff --git a/x b/x
+        \\--- a/x
+        \\+++ b/x
+        \\@@ -1,2 +1,2 @@
+        \\ a
+        \\-old
+        \\+new
+        \\diff --git a/y b/y
+        \\--- a/y
+        \\+++ b/y
+        \\@@ -1,1 +1,1 @@
+        \\ keep
+        \\
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, p: []const u8) !void {
+            const files = try parsePatch(allocator, p, .explicit);
+            for (files) |*file| file.deinit(allocator);
+            allocator.free(files);
+        }
+    }.run, .{patch});
 }
 
 test "review target kind" {

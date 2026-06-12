@@ -175,16 +175,16 @@ fn rangesFromTokens(allocator: std.mem.Allocator, tokens: []const Token, matched
 
 fn affixRanges(allocator: std.mem.Allocator, old_text: []const u8, new_text: []const u8) !PairRanges {
     const prefix = commonPrefix(old_text, new_text);
-    const old_suffix = commonSuffix(old_text[prefix..], new_text[prefix..]);
-    const new_suffix = old_suffix;
+    // commonSuffix is symmetric in length, so the trailing run is identical for both sides.
+    const suffix = commonSuffix(old_text[prefix..], new_text[prefix..]);
 
     var old_ranges: std.ArrayList(Range) = .empty;
     errdefer old_ranges.deinit(allocator);
     var new_ranges: std.ArrayList(Range) = .empty;
     errdefer new_ranges.deinit(allocator);
 
-    if (prefix < old_text.len - old_suffix) try old_ranges.append(allocator, .{ .start = prefix, .end = old_text.len - old_suffix });
-    if (prefix < new_text.len - new_suffix) try new_ranges.append(allocator, .{ .start = prefix, .end = new_text.len - new_suffix });
+    if (prefix < old_text.len - suffix) try old_ranges.append(allocator, .{ .start = prefix, .end = old_text.len - suffix });
+    if (prefix < new_text.len - suffix) try new_ranges.append(allocator, .{ .start = prefix, .end = new_text.len - suffix });
 
     const old_owned = try old_ranges.toOwnedSlice(allocator);
     errdefer allocator.free(old_owned);
@@ -198,6 +198,9 @@ fn affixRanges(allocator: std.mem.Allocator, old_text: []const u8, new_text: []c
 
 fn appendRange(allocator: std.mem.Allocator, ranges: *std.ArrayList(Range), range: Range) !void {
     if (range.end <= range.start) return;
+    // Safety net: coalesce with the previous range if it overlaps or abuts. The current
+    // sole caller emits disjoint ascending ranges so this never triggers today, but keeping
+    // it makes appendRange correct for any future caller that emits overlapping ranges.
     if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end >= range.start) {
         ranges.items[ranges.items.len - 1].end = @max(ranges.items[ranges.items.len - 1].end, range.end);
         return;

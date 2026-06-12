@@ -57,6 +57,7 @@ pub fn nowIso(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
 pub fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
     if (args.len == 0) return dupe(allocator, "working-tree");
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     for (args, 0..) |arg, i| {
         if (i > 0) try out.append(allocator, ' ');
         try out.appendSlice(allocator, arg);
@@ -64,22 +65,58 @@ pub fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (value) |c| {
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < value.len) {
+        const c = value[i];
         switch (c) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
+            '"' => {
+                try out.appendSlice(allocator, "\\\"");
+                i += 1;
+            },
+            '\\' => {
+                try out.appendSlice(allocator, "\\\\");
+                i += 1;
+            },
+            '\n' => {
+                try out.appendSlice(allocator, "\\n");
+                i += 1;
+            },
+            '\r' => {
+                try out.appendSlice(allocator, "\\r");
+                i += 1;
+            },
+            '\t' => {
+                try out.appendSlice(allocator, "\\t");
+                i += 1;
+            },
             else => {
                 if (c < 0x20) {
-                    const escaped_control = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
-                    defer allocator.free(escaped_control);
-                    try out.appendSlice(allocator, escaped_control);
-                } else {
+                    var buf: [8]u8 = undefined;
+                    const escaped = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try out.appendSlice(allocator, escaped);
+                    i += 1;
+                } else if (c < 0x80) {
                     try out.append(allocator, c);
+                    i += 1;
+                } else {
+                    // Multi-byte UTF-8: emit valid sequences verbatim (valid JSON),
+                    // and replace any invalid byte with U+FFFD so the result is always
+                    // valid UTF-8 / parseable JSON regardless of argv or git path bytes.
+                    const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
+                        try out.appendSlice(allocator, "\u{fffd}");
+                        i += 1;
+                        continue;
+                    };
+                    if (i + seq_len <= value.len and std.unicode.utf8ValidateSlice(value[i .. i + seq_len])) {
+                        try out.appendSlice(allocator, value[i .. i + seq_len]);
+                        i += seq_len;
+                    } else {
+                        try out.appendSlice(allocator, "\u{fffd}");
+                        i += 1;
+                    }
                 }
             },
         }

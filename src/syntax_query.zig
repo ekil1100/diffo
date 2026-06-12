@@ -41,6 +41,9 @@ pub fn build(
     source: []u8,
 ) !SideHighlight {
     errdefer allocator.free(source);
+    // Defensive: tree-sitter byte offsets are u32, so a >=4 GiB source would overflow the
+    // @intCast in the FFI layer. The only caller caps source at 512 KiB, so this never trips.
+    if (source.len > std.math.maxInt(u32)) return error.SourceTooLarge;
     const line_starts = try buildLineStarts(allocator, source);
     errdefer allocator.free(line_starts);
 
@@ -73,10 +76,15 @@ pub fn build(
     }
 
     var spans_by_line = try allocator.alloc([]syntax.HighlightSpan, line_spans.len);
-    errdefer allocator.free(spans_by_line);
+    var built: usize = 0;
+    errdefer {
+        for (spans_by_line[0..built]) |spans| allocator.free(spans);
+        allocator.free(spans_by_line);
+    }
     for (line_spans, 0..) |*spans, i| {
         std.mem.sort(syntax.HighlightSpan, spans.items, {}, lessSpan);
         spans_by_line[i] = try spans.toOwnedSlice(allocator);
+        built = i + 1;
     }
 
     return .{
@@ -195,7 +203,9 @@ fn predicatePass(query: *c.TSQuery, match: c.TSQueryMatch, source: []const u8, s
         if (util.eql(normalized, "not-match?")) return !matched;
         return matched;
     }
-    return false;
+    // Unrecognized predicate directive: treat it as non-filtering rather than dropping the whole
+    // match's highlights, so a future grammar's new directive degrades gracefully.
+    return true;
 }
 
 fn predicateValue(query: *c.TSQuery, match: c.TSQueryMatch, source: []const u8, step: c.TSQueryPredicateStep) ?[]const u8 {

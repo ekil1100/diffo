@@ -16,12 +16,13 @@ pub fn main(init: std.process.Init) !void {
         const msg = switch (err) {
             error.NotGitRepository => "diffo: current directory is not inside a Git repository\n",
             error.GitCommandFailed => "diffo: git command failed; run with --debug-git for details\n",
+            error.DiffTooLarge => "diffo: diff is too large to load (over 200MB); narrow the review range\n",
             error.InvalidArguments => "diffo: invalid arguments; use diffo --help\n",
             error.StorageCorrupted => "diffo: stored review data is corrupted\n",
             error.ThemeInvalid => "diffo: theme file does not look like Base16/Base24\n",
             else => try std.fmt.allocPrint(allocator, "diffo: {s}\n", .{@errorName(err)}),
         };
-        defer if (err != error.NotGitRepository and err != error.GitCommandFailed and err != error.InvalidArguments and err != error.StorageCorrupted and err != error.ThemeInvalid) allocator.free(msg);
+        defer if (err != error.NotGitRepository and err != error.GitCommandFailed and err != error.DiffTooLarge and err != error.InvalidArguments and err != error.StorageCorrupted and err != error.ThemeInvalid) allocator.free(msg);
         stderr.writeStreamingAll(init.io, msg) catch {};
         std.process.exit(1);
     };
