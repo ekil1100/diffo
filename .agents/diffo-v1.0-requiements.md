@@ -1,5 +1,7 @@
 # diffo v1.0 Polish UI Requirements
 
+> 历史记录：本文描述 Zig 阶段的需求，不代表当前 Rust 实现。当前功能与构建说明见 `README.md`。
+
 ## 1. 文档信息
 
 - 项目名称：diffo

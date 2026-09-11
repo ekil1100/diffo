@@ -1,5 +1,7 @@
 # `diffo` Security & Quality Audit — Final Report
 
+> 历史记录：本文审计的是迁移前的 Zig 实现，行号与结论不适用于当前 Rust 代码；当时的源码和审计脚本可从 Git 历史查阅。
+
 ## 1. Executive Summary
 
 `diffo` builds cleanly and passes its full test suite on Zig 0.16.0 with zero compiler diagnostics. The code is well-structured and the happy paths are correct, but the audit surfaced a dense cluster of **memory-ownership defects (22 of 64 findings)** concentrated in two areas: the snapshot-load/teardown sequence in `cli.zig`/`git.zig`, and the comment/state persistence paths in `store.zig`. The single critical issue is a use-after-return on the universal keystroke path. The remaining high-severity issues are double-frees and one parser crash, almost all gated behind error paths (write failure, OOM, corrupt store, malformed patch) rather than the happy path — real memory-safety defects, but mostly bounded to a crash on an already-failing operation.

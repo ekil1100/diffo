@@ -1,3 +1,0 @@
-tree-sitter runtime
-repo: https://github.com/tree-sitter/tree-sitter
-commit: 8d737aa238084f9a51f1e97c195a362419beee8d

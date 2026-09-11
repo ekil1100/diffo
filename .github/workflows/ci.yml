@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --locked
+      - name: Terminal regression tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test_binary="$(cargo test --locked --lib --no-run --message-format=json | python3 -c 'import json, sys; artifacts = [json.loads(line) for line in sys.stdin]; print(next(a["executable"] for a in artifacts if a.get("executable") and a.get("target", {}).get("kind") == ["lib"]))')"
+          python3 tests/terminal.py --test-binary "$test_binary"
+
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.88.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets

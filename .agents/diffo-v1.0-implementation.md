@@ -1,5 +1,7 @@
 # diffo v1.0 Polish UI Implementation Plan
 
+> 历史记录：本文是 Zig 阶段的实施计划，不再作为当前构建或修改指引。Rust 模块与验证方式见 `AGENTS.md` 和 `README.md`。
+
 ## 1. 文档信息
 
 - 项目名称：diffo

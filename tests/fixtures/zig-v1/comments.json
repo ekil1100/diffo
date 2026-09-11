@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "comments": [
+    {
+        "comment_id": "cmt_30fa2c802d5b5a0e",
+        "repository_id": "repo_fd96918bc4822d7b",
+        "review_target_id": "target_f4af5bf8b84150f4",
+        "file_path": "sample.rs",
+      "anchor": {
+        "side": "new",
+        "start_line": 1,
+        "end_line": 3,
+        "stable_line_ids": ["line_160c1bc469d68225"],
+        "hunk_header": "@@ -1,3 +1,3 @@",
+        "context_before": [],
+        "context_after": [],
+        "patch_fingerprint": "sha256:81cc55debad4598f3bd88d3e1a7089486b477de6c2a33c61fb5112b45e5c5995",
+        "match_status": "exact"
+      },
+        "body": "Review this block.\nUTF-8: 中文",
+        "author": "Migration Test",
+        "created_at": "2026-09-11T08:40:03Z",
+        "updated_at": "2026-09-11T08:40:03Z"
+    },
+    {
+        "comment_id": "cmt_50b772cd80419d36",
+        "repository_id": "repo_fd96918bc4822d7b",
+        "review_target_id": "target_f4af5bf8b84150f4",
+        "file_path": "sample.rs",
+      "anchor": {
+        "side": "old",
+        "start_line": 2,
+        "end_line": 2,
+        "stable_line_ids": ["line_c54e1d96e58f06d0"],
+        "hunk_header": "@@ -1,3 +1,3 @@",
+        "context_before": [],
+        "context_after": [],
+        "patch_fingerprint": "sha256:81cc55debad4598f3bd88d3e1a7089486b477de6c2a33c61fb5112b45e5c5995",
+        "match_status": "exact"
+      },
+        "body": "Check the deleted side.",
+        "author": "Migration Test",
+        "created_at": "2026-09-11T08:40:03Z",
+        "updated_at": "2026-09-11T08:40:03Z"
+    }
+  ]
+}
