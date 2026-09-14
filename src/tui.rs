@@ -316,6 +316,9 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
         if terminal.interrupted.load(Ordering::Relaxed) {
             break;
         }
+        // Pace wheel bursts, not isolated inputs or keyboard/editor actions.
+        #[cfg(unix)]
+        let scroll_deadline = std::time::Instant::now() + Duration::from_millis(16);
         let layout = Layout::terminal().with_panels(&state);
         let mut frame = renderer.frame(snapshot, store, &mut state, layout, true)?;
         if let Some(input) = &editor {
@@ -418,7 +421,20 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
                 }
                 KeyAction::Continue => {}
             },
-            Event::Mouse(mouse) => handle_mouse(snapshot, store, &mut state, mouse, layout),
+            Event::Mouse(mouse) => {
+                #[cfg(unix)]
+                let repeat = if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) {
+                    input.coalesce_scroll(mouse, scroll_deadline)
+                } else {
+                    1
+                };
+                #[cfg(not(unix))]
+                let repeat = 1;
+                handle_mouse(snapshot, store, &mut state, mouse, repeat, layout);
+            }
             Event::Resize(_, _) => {
                 state.cursor_line = 0;
                 state.scroll_line = 0;
@@ -882,6 +898,7 @@ fn handle_mouse(
     store: &Store,
     state: &mut State,
     mouse: MouseEvent,
+    repeat: u16,
     layout: Layout,
 ) {
     let layout = layout.with_panels(state);
@@ -899,8 +916,8 @@ fn handle_mouse(
     let sidebar = (mouse.column as usize) < layout.sidebar_width;
     let dock = !sidebar && layout.dock_height > 0 && mouse.row as usize >= layout.dock_y;
     let delta = match mouse.kind {
-        MouseEventKind::ScrollUp => -3,
-        MouseEventKind::ScrollDown => 3,
+        MouseEventKind::ScrollUp => -3 * repeat as isize,
+        MouseEventKind::ScrollDown => 3 * repeat as isize,
         _ => 0,
     };
     if delta != 0 {
@@ -3451,6 +3468,7 @@ mod tests {
                 5,
                 (offset + 2) as u16,
             ),
+            1,
             l,
         );
         assert_eq!(s.cursor_row, long);
@@ -3459,6 +3477,7 @@ mod tests {
             &f.store,
             &mut s,
             mouse(MouseEventKind::Drag(MouseButton::Left), 5, 2),
+            1,
             l,
         );
         assert_eq!(s.selection_start, Some(long));
@@ -3469,6 +3488,7 @@ mod tests {
             &f.store,
             &mut s,
             mouse(MouseEventKind::Down(MouseButton::Left), 1, 3),
+            1,
             l,
         );
         assert_eq!(s.active_file, 1);
@@ -3478,6 +3498,7 @@ mod tests {
             &f.store,
             &mut s,
             mouse(MouseEventKind::ScrollUp, 1, 4),
+            1,
             l,
         );
         assert_eq!(s.active_file, 1);
@@ -3489,9 +3510,107 @@ mod tests {
             &f.store,
             &mut s,
             mouse(MouseEventKind::ScrollDown, x, 4),
+            1,
             l,
         );
         assert!(s.cursor_row >= long);
+    }
+
+    #[test]
+    fn batched_wheel_selects_files_without_opening_them() {
+        let patch: String = (0..8)
+            .map(|n| PATCH.replace("sample.txt", &format!("file{n}.txt")))
+            .collect();
+        let f = Fixture::new(&patch);
+        for (kind, start, count, expected) in [
+            (MouseEventKind::ScrollDown, 0, 2, 6),
+            (MouseEventKind::ScrollDown, 0, 256, 7),
+            (MouseEventKind::ScrollUp, 7, 2, 1),
+            (MouseEventKind::ScrollUp, 7, 256, 0),
+        ] {
+            let mut s = State {
+                active_file: 2,
+                cursor_row: 3,
+                scroll_row: 1,
+                sidebar_open: true,
+                file_cursor: start,
+                ..State::default()
+            };
+            let mouse = MouseEvent {
+                kind,
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(
+                &f.snapshot,
+                &f.store,
+                &mut s,
+                mouse,
+                count,
+                Layout::new(140, 24),
+            );
+            assert_eq!(s.file_cursor, expected);
+            assert_eq!(s.focus, Focus::Files);
+            assert_eq!((s.active_file, s.cursor_row, s.scroll_row), (2, 3, 1));
+        }
+    }
+
+    #[test]
+    fn batched_wheel_matches_single_events_across_wrapping_and_folds() {
+        let patch = long_patch(90, &[10, 50, 80])
+            .replace(" line 40\n", &format!(" {}\n", "wide word ".repeat(180)));
+        let f = Fixture::new(&patch);
+        let l = Layout::new(80, 16);
+        for mode in [ViewMode::Stacked, ViewMode::Split] {
+            for fold_mode in [FoldMode::Fold, FoldMode::Unfold] {
+                for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+                    for count in [1, 8, 48, 256] {
+                        let initial = || {
+                            let mut state = State {
+                                mode,
+                                fold_mode,
+                                ..State::default()
+                            };
+                            if kind == MouseEventKind::ScrollUp {
+                                state.cursor_row = state.view(&f.snapshot).rows.len() - 1;
+                            }
+                            state.selection_start = Some(state.cursor_row);
+                            state
+                        };
+                        let mut single = initial();
+                        let mut batch = initial();
+                        let view = single.view(&f.snapshot);
+                        ensure_visible(&f.snapshot, &f.store, &view, &mut single, l);
+                        ensure_visible(&f.snapshot, &f.store, &view, &mut batch, l);
+                        let mouse = MouseEvent {
+                            kind,
+                            column: 5,
+                            row: 5,
+                            modifiers: KeyModifiers::NONE,
+                        };
+                        for _ in 0..count {
+                            handle_mouse(&f.snapshot, &f.store, &mut single, mouse, 1, l);
+                        }
+                        handle_mouse(&f.snapshot, &f.store, &mut batch, mouse, count, l);
+                        let position = |s: &State| {
+                            (
+                                s.cursor_row,
+                                s.cursor_line,
+                                s.scroll_row,
+                                s.scroll_line,
+                                s.selection_start,
+                            )
+                        };
+                        assert_eq!(
+                            position(&single),
+                            position(&batch),
+                            "{mode:?} {fold_mode:?} {kind:?} {count}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

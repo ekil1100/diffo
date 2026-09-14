@@ -366,6 +366,35 @@ def repeated_navigation(session):
     session.finish()
 
 
+def wheel_bursts(session):
+    down, up = b"\x1b[<65;50;15M", b"\x1b[<64;50;15M"
+    for sequence, target in [(down, 289), (up, 1)]:
+        start = len(session.output)
+        rows = session.navigate(sequence * 96, f"CODE new:{target} ".encode())
+        emitted = bytes(session.output[start:])
+        frames = emitted.count(b"\x1b[?2026h")
+        assert frames <= 8, (frames, "Wheel bursts created a frame per event")
+        cursor = [row for row in rows[1:-1] if row.startswith("> ")]
+        assert len(cursor) == 1 and f"value_{target:05}" in cursor[0], cursor
+    session.navigate(down * 4 + b"c", b"Shift+Enter newline")
+    body = "wheel anchor\n" + "\n".join(f"note {n:02}" for n in range(1, 31))
+    session.send(b"\x1b[200~" + body.encode() + b"\x1b[201~")
+    session.save([body])
+    assert session.comments()[0]["anchor"]["start_line"] == 13, "Coalescing reordered the comment key"
+    rows = session.navigate(b"\r", b"COMMENTS  new:13")
+    code = rows[1:15]
+    rows = session.navigate(b"\x1b[<65;50;18M" * 16, b"COMMENTS  j/k scroll")
+    assert rows[1:15] == code and "note 30" in rows[22], "Comment scrolling moved code or lost its limit"
+    rows = session.navigate(b"\x1b[<64;50;18M" * 16, b"COMMENTS  j/k scroll")
+    assert rows[1:15] == code and "wheel anchor" in rows[17], "Comment scrolling failed to return to the start"
+    session.navigate(b"\x1b", b"CODE new:13 ")
+    session.navigate(up * 2, b"CODE new:7 ")
+    session.navigate(b"gg", b"CODE file")
+    session.navigate(up * 2 + down * 2, b"CODE new:6 ")
+    session.send(b"q")
+    session.finish()
+
+
 def workbench(session):
     session.navigate(b"j", b"CODE new:2")
     session.navigate(b"\t", b"FILES  1/2")
@@ -467,6 +496,7 @@ def main():
     cases = [
         ("cursor-first", cursor_first, "".join(f"line {n}\n" for n in range(1, 81))),
         ("key-repeat", repeated_navigation, {"sample.rs": "".join(f"    let value_{n:05} = calculate_value(input, options, context);\n" for n in range(1, 601))}),
+        ("wheel-bursts", wheel_bursts, {"sample.rs": "".join(f"    let value_{n:05} = calculate_value(input, options, context);\n" for n in range(1, 601))}),
         ("workbench", workbench, {"a.txt": "".join(f"line {n}\n" for n in range(1, 81)), "src/b.rs": "fn work() {\n    let result = 1;\n}\n"}),
         ("shift-enter", parity, SAMPLE), ("editing-paste", editing, SAMPLE),
         ("mouse-resize", mouse_resize, SAMPLE), ("input-error", invalid_input, SAMPLE),

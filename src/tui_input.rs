@@ -10,6 +10,7 @@ use std::{
 };
 
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(35);
+const MAX_SCROLL_EVENTS: u16 = 256;
 const SEQUENCE_LIMIT: usize = 256;
 const PASTE_LIMIT: usize = 1024 * 1024;
 const PASTE_START: &[u8] = b"\x1b[200~";
@@ -19,13 +20,48 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 pub(super) struct Input {
     decoder: Decoder,
     escape_since: Option<Instant>,
+    pending: Option<io::Result<Event>>,
 }
 impl Input {
     pub fn read(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         self.read_fd(libc::STDIN_FILENO, timeout)
     }
 
+    /// Include the already-read event; wait only until the caller's frame deadline.
+    pub fn coalesce_scroll(&mut self, first: MouseEvent, deadline: Instant) -> u16 {
+        self.coalesce_scroll_fd(libc::STDIN_FILENO, first, deadline)
+    }
+
+    fn coalesce_scroll_fd(&mut self, fd: RawFd, first: MouseEvent, deadline: Instant) -> u16 {
+        debug_assert!(matches!(
+            first.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ));
+        let mut count = 1;
+        // Only identical wheel events commute. Keep the first different event or
+        // error pending so it is handled after this batch, never reordered or lost.
+        while count < MAX_SCROLL_EVENTS {
+            match self.read_fd(fd, deadline.saturating_duration_since(Instant::now())) {
+                Ok(Some(Event::Mouse(next))) if next == first => count += 1,
+                Ok(None) if Instant::now() < deadline => continue,
+                Ok(None) => break,
+                Ok(Some(event)) => {
+                    self.pending = Some(Ok(event));
+                    break;
+                }
+                Err(error) => {
+                    self.pending = Some(Err(error));
+                    break;
+                }
+            }
+        }
+        count
+    }
+
     fn read_fd(&mut self, fd: RawFd, timeout: Duration) -> io::Result<Option<Event>> {
+        if let Some(pending) = self.pending.take() {
+            return pending.map(Some);
+        }
         if let Some(event) = self.decoder.next(false)? {
             self.escape_since = None;
             return Ok(Some(event));
@@ -46,14 +82,13 @@ impl Input {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: pollfd points to one initialized descriptor for the duration of poll.
-        let ready = unsafe {
-            libc::poll(
-                &mut pollfd,
-                1,
-                wait.as_millis().max(1).min(i32::MAX as u128) as i32,
-            )
+        let wait_ms = if wait.is_zero() {
+            0
+        } else {
+            wait.as_millis().max(1).min(i32::MAX as u128) as i32
         };
+        // SAFETY: pollfd points to one initialized descriptor for the duration of poll.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, wait_ms) };
         if ready < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -609,6 +644,118 @@ mod tests {
         }
         let bytes = [PASTE_START, &vec![b'a'; PASTE_LIMIT], PASTE_END].concat();
         assert_eq!(events(&bytes), [Event::Paste("a".repeat(PASTE_LIMIT))]);
+    }
+
+    const WHEEL: &[u8] = b"\x1b[<65;5;6M";
+
+    fn read_mouse(input: &mut Input, fd: RawFd) -> MouseEvent {
+        let Some(Event::Mouse(mouse)) = input.read_fd(fd, Duration::ZERO).unwrap() else {
+            panic!("Expected a mouse event");
+        };
+        mouse
+    }
+
+    #[test]
+    fn scroll_batches_preserve_event_boundaries_and_deferred_errors() {
+        for boundary in [
+            b"c".as_slice(),
+            b"\x03",
+            b"\x1b[<64;5;6M",
+            b"\x1b[<65;8;6M",
+            b"\x1b[<65;5;7M",
+            b"\x1b[<69;5;6M",
+            b"\x1b[<0;5;6M",
+            b"\x1b[<0;5;6m",
+            b"\x1b[<35;5;6M",
+            b"\x1b[200~qyc\n\x1b[201~",
+        ] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            let fd = reader.as_raw_fd();
+            writer
+                .write_all(&[WHEEL.repeat(4), boundary.to_vec(), WHEEL.repeat(2)].concat())
+                .unwrap();
+            drop(writer);
+            let mut input = Input::default();
+            let first = read_mouse(&mut input, fd);
+            assert_eq!(input.coalesce_scroll_fd(fd, first, Instant::now()), 4);
+            assert_eq!(
+                input.read_fd(fd, Duration::ZERO).unwrap(),
+                Some(events(boundary).remove(0))
+            );
+            let next = read_mouse(&mut input, fd);
+            assert_eq!(next, first);
+            assert_eq!(input.coalesce_scroll_fd(fd, next, Instant::now()), 2);
+            // The queued EOF must be returned before consulting a different fd.
+            assert_eq!(
+                input.read_fd(i32::MAX, Duration::ZERO).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(
+                input
+                    .read_fd(i32::MAX, Duration::ZERO)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_batches_are_bounded_and_preserve_the_remainder() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        writer
+            .write_all(&[WHEEL.repeat(MAX_SCROLL_EVENTS as usize + 2), b"c".to_vec()].concat())
+            .unwrap();
+        let mut input = Input::default();
+        let first = read_mouse(&mut input, fd);
+        assert_eq!(
+            input.coalesce_scroll_fd(fd, first, Instant::now()),
+            MAX_SCROLL_EVENTS
+        );
+        let next = read_mouse(&mut input, fd);
+        assert_eq!(input.coalesce_scroll_fd(fd, next, Instant::now()), 2);
+        assert_eq!(
+            input.read_fd(fd, Duration::ZERO).unwrap(),
+            Some(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn scroll_batches_preserve_fragmented_sequences_and_escape_timeout() {
+        for split in 1..WHEEL.len() {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            let fd = reader.as_raw_fd();
+            writer
+                .write_all(&[WHEEL, &WHEEL[..split]].concat())
+                .unwrap();
+            let mut input = Input::default();
+            let first = read_mouse(&mut input, fd);
+            assert_eq!(input.coalesce_scroll_fd(fd, first, Instant::now()), 1);
+            assert_eq!(input.decoder.bytes, &WHEEL[..split]);
+            writer.write_all(&[&WHEEL[split..], b"c"].concat()).unwrap();
+            if split == 1 {
+                // Model arrival before Escape expiry, independent of scheduler pauses.
+                input.escape_since = Some(Instant::now());
+            }
+            assert_eq!(read_mouse(&mut input, fd), first);
+            assert_eq!(
+                input.read_fd(fd, Duration::ZERO).unwrap(),
+                Some(key(KeyCode::Char('c'), KeyModifiers::NONE))
+            );
+        }
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        writer.write_all(&[WHEEL, b"\x1b"].concat()).unwrap();
+        let mut input = Input::default();
+        let first = read_mouse(&mut input, fd);
+        assert_eq!(input.coalesce_scroll_fd(fd, first, Instant::now()), 1);
+        assert_eq!(input.decoder.bytes, b"\x1b");
+        input.escape_since = Some(Instant::now() - ESCAPE_TIMEOUT);
+        assert_eq!(
+            input.read_fd(fd, Duration::ZERO).unwrap(),
+            Some(key(KeyCode::Esc, KeyModifiers::NONE))
+        );
     }
 
     #[test]
