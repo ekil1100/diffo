@@ -1,5 +1,8 @@
+use std::{ops::Range, sync::Arc};
+
 use tree_sitter::{
-    Language, Node, Parser, Query, QueryCursor, QueryMatch, QueryPredicateArg, StreamingIterator,
+    Language, Node, Parser, Point, Query, QueryCursor, QueryMatch, QueryPredicateArg,
+    StreamingIterator, Tree,
 };
 
 use crate::{
@@ -8,12 +11,17 @@ use crate::{
 };
 
 pub const MAX_FILE_SIZE: usize = 512 * 1024;
+const CHUNK_LINES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct SideHighlight {
     pub source: Vec<u8>,
     pub line_starts: Vec<usize>,
     pub spans_by_line: Vec<Vec<HighlightSpan>>,
+    tree: Tree,
+    query: Arc<Query>,
+    highlighted_chunks: Vec<bool>,
+    query_failed: bool,
 }
 
 impl SideHighlight {
@@ -23,15 +31,79 @@ impl SideHighlight {
         Some(&self.source[start..line_end(&self.source, &self.line_starts, index)])
     }
 
-    pub fn line_spans(&self, line_number: u32) -> &[HighlightSpan] {
-        line_number
-            .checked_sub(1)
-            .and_then(|index| self.spans_by_line.get(index as usize))
-            .map_or(&[], Vec::as_slice)
+    pub fn line_spans(&mut self, line_number: u32) -> &[HighlightSpan] {
+        let Some(index) = line_number.checked_sub(1).map(|index| index as usize) else {
+            return &[];
+        };
+        if index >= self.line_starts.len() || self.query_failed {
+            return &[];
+        }
+        let chunk = index / CHUNK_LINES;
+        if !self.highlighted_chunks[chunk] {
+            self.highlight_chunk(chunk);
+        }
+        if self.query_failed {
+            &[]
+        } else {
+            &self.spans_by_line[index]
+        }
+    }
+
+    fn highlight_chunk(&mut self, chunk: usize) {
+        let start = chunk * CHUNK_LINES;
+        let end = (start + CHUNK_LINES).min(self.line_starts.len());
+        let mut cursor = QueryCursor::new();
+        // Query the full tree with an intersecting range: multiline captures and
+        // ancestor-dependent predicates still see their complete syntax context.
+        cursor.set_point_range(Point::new(start, 0)..Point::new(end, 0));
+        {
+            // Official bindings handle eq?, any-of?, match? and their negations.
+            // Lua predicates remain application-defined.
+            let mut matches =
+                cursor.matches(&self.query, self.tree.root_node(), self.source.as_slice());
+            while let Some(found) = matches.next() {
+                if !general_predicates_pass(&self.query, found, &self.source) {
+                    continue;
+                }
+                for capture in found.captures {
+                    if let Some(token) =
+                        token_for_capture(self.query.capture_names()[capture.index as usize])
+                    {
+                        append_capture_span(
+                            &mut self.spans_by_line,
+                            &self.line_starts,
+                            &self.source,
+                            capture.node,
+                            token,
+                            start..end,
+                        );
+                    }
+                }
+            }
+        }
+        if cursor.did_exceed_match_limit() {
+            // Negative-cache failed queries instead of retrying them on every frame.
+            self.query_failed = true;
+            return;
+        }
+        for spans in &mut self.spans_by_line[start..end] {
+            // Stable sorting retains query order for captures of identical bytes.
+            spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+        }
+        self.highlighted_chunks[chunk] = true;
     }
 }
 
-pub fn build(language: Language, query_source: &str, source: Vec<u8>) -> Result<SideHighlight> {
+pub fn compile(language: &Language, query_source: &str) -> Result<Arc<Query>> {
+    Query::new(language, query_source)
+        .map(Arc::new)
+        .map_err(|err| {
+            eprintln!("tree-sitter query compile failed: {err}");
+            Error::SyntaxUnavailable
+        })
+}
+
+pub fn build(language: Language, query: Arc<Query>, source: Vec<u8>) -> Result<SideHighlight> {
     if source.len() > MAX_FILE_SIZE {
         return Err(Error::SourceTooLarge);
     }
@@ -42,47 +114,17 @@ pub fn build(language: Language, query_source: &str, source: Vec<u8>) -> Result<
     let tree = parser
         .parse(&source, None)
         .ok_or(Error::SyntaxUnavailable)?;
-    let query = Query::new(&language, query_source).map_err(|err| {
-        eprintln!("tree-sitter query compile failed: {err}");
-        Error::SyntaxUnavailable
-    })?;
     let line_starts = build_line_starts(&source);
-    let mut spans_by_line = vec![Vec::new(); line_starts.len()];
-    let mut cursor = QueryCursor::new();
-    {
-        // The official bindings evaluate eq?, any-of?, match? and their
-        // negations against source bytes. Lua predicates remain application-defined.
-        let mut matches = cursor.matches(&query, tree.root_node(), source.as_slice());
-        while let Some(found) = matches.next() {
-            if !general_predicates_pass(&query, found, &source) {
-                continue;
-            }
-            for capture in found.captures {
-                if let Some(token) =
-                    token_for_capture(query.capture_names()[capture.index as usize])
-                {
-                    append_capture_span(
-                        &mut spans_by_line,
-                        &line_starts,
-                        &source,
-                        capture.node,
-                        token,
-                    );
-                }
-            }
-        }
-    }
-    if cursor.did_exceed_match_limit() {
-        return Err(Error::SyntaxUnavailable);
-    }
-    for spans in &mut spans_by_line {
-        // Stable sorting retains query order when two captures cover identical bytes.
-        spans.sort_by_key(|span| (span.start_byte, span.end_byte));
-    }
+    let spans_by_line = vec![Vec::new(); line_starts.len()];
+    let highlighted_chunks = vec![false; line_starts.len().div_ceil(CHUNK_LINES)];
     Ok(SideHighlight {
         source,
         line_starts,
         spans_by_line,
+        tree,
+        query,
+        highlighted_chunks,
+        query_failed: false,
     })
 }
 
@@ -113,9 +155,10 @@ fn append_capture_span(
     source: &[u8],
     node: Node<'_>,
     token: SyntaxToken,
+    rows: Range<usize>,
 ) {
-    let first_row = node.start_position().row;
-    let last_row = node.end_position().row.min(lines.len() - 1);
+    let first_row = node.start_position().row.max(rows.start);
+    let last_row = node.end_position().row.min(rows.end - 1);
     if node.end_byte() <= node.start_byte() || first_row >= lines.len() {
         return;
     }
@@ -239,9 +282,14 @@ mod tests {
     use super::*;
     use crate::syntax_grammars;
 
+    fn build_with_query(language: Language, query: &str, source: Vec<u8>) -> Result<SideHighlight> {
+        let query = compile(&language, query)?;
+        build(language, query, source)
+    }
+
     fn highlight(name: &str, source: &str) -> SideHighlight {
         let grammar = syntax_grammars::find(name).unwrap();
-        build(
+        build_with_query(
             grammar.language(),
             grammar.query,
             source.as_bytes().to_vec(),
@@ -249,12 +297,121 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to highlight {name}: {err}"))
     }
 
-    fn has_token(highlight: &SideHighlight, line: u32, token: SyntaxToken, text: &str) -> bool {
+    fn has_token(highlight: &mut SideHighlight, line: u32, token: SyntaxToken, text: &str) -> bool {
+        let spans = highlight.line_spans(line).to_vec();
         let source = highlight.line_text(line).unwrap();
-        highlight.line_spans(line).iter().any(|span| {
+        spans.iter().any(|span| {
             span.token == token
                 && source.get(span.start_byte..span.end_byte) == Some(text.as_bytes())
         })
+    }
+
+    #[test]
+    fn file_switch_highlighting_only_computes_requested_lines() {
+        let source: String = (0..4000).map(|i| format!("fn f_{i}() {{}}\n")).collect();
+        let mut h = highlight("rust", &source);
+        let computed = |h: &SideHighlight| {
+            h.spans_by_line
+                .iter()
+                .filter(|spans| !spans.is_empty())
+                .count()
+        };
+        assert_eq!(
+            computed(&h),
+            0,
+            "Opening a file must not highlight offscreen lines"
+        );
+        assert!(has_token(&mut h, 3900, SyntaxToken::Keyword, "fn"));
+        assert!((1..=128).contains(&computed(&h)));
+        let first_chunk = computed(&h);
+        let spans = h.line_spans(3900).to_vec();
+        assert_eq!(h.line_spans(3900), spans);
+        assert_eq!(computed(&h), first_chunk);
+        assert!(has_token(&mut h, 1, SyntaxToken::Keyword, "fn"));
+        assert!(computed(&h) > first_chunk);
+        assert!(computed(&h) <= 256);
+        assert!(h.line_spans(0).is_empty());
+        assert!(h.line_spans(4001).is_empty());
+    }
+
+    #[test]
+    fn chunked_queries_match_full_queries_across_languages_and_multiline_captures() {
+        let mut cases: Vec<_> = [
+            ("zig", "const value = \"架\";\n"),
+            ("javascript", "const value = `first\nsecond`;\n"),
+            (
+                "typescript",
+                "function f(\n  value: number,\n) { return value; }\n",
+            ),
+            ("tsx", "const view = <div>{\"架\"}</div>;\n"),
+            ("rust", "fn f() { let value = \"first\nsecond\"; }\n"),
+            ("c", "/* first\nsecond */\nint f(void) { return 1; }\n"),
+            (
+                "cpp",
+                "class App { public:\n  int run() { return 1; }\n};\n",
+            ),
+            (
+                "python",
+                "def f():\n    \"\"\"first\n    second\"\"\"\n    return True\n",
+            ),
+            (
+                "gn",
+                "executable(\"foo\") {\n  sources = [ \"foo.cc\" ]\n}\n",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, source)| (name, source.repeat(CHUNK_LINES + 1)))
+        .collect();
+        cases.push((
+            "rust",
+            format!(
+                "/* first\n{}last */\nfn main() {{}}\n",
+                "中间 🦀\r\n".repeat(CHUNK_LINES * 3)
+            ),
+        ));
+        for (name, source) in cases {
+            let mut h = highlight(name, &source);
+            assert!(!h.tree.root_node().has_error(), "Invalid {name} fixture");
+            let mut expected = vec![Vec::new(); h.line_starts.len()];
+            let mut cursor = QueryCursor::new();
+            {
+                let mut matches = cursor.matches(&h.query, h.tree.root_node(), h.source.as_slice());
+                while let Some(found) = matches.next() {
+                    if !general_predicates_pass(&h.query, found, &h.source) {
+                        continue;
+                    }
+                    for capture in found.captures {
+                        if let Some(token) =
+                            token_for_capture(h.query.capture_names()[capture.index as usize])
+                        {
+                            append_capture_span(
+                                &mut expected,
+                                &h.line_starts,
+                                &h.source,
+                                capture.node,
+                                token,
+                                0..h.line_starts.len(),
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(!cursor.did_exceed_match_limit());
+            for spans in &mut expected {
+                spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+            }
+            // Navigate backwards first, so no earlier chunk can prime later captures.
+            for (index, spans) in expected.iter().enumerate().rev() {
+                assert_eq!(
+                    h.line_spans(index as u32 + 1),
+                    spans,
+                    "{name}, line {}",
+                    index + 1
+                );
+            }
+            assert_eq!(h.spans_by_line, expected, "{name}");
+            assert!(h.highlighted_chunks.iter().all(|&ready| ready));
+        }
     }
 
     #[test]
@@ -327,9 +484,9 @@ mod tests {
                 "executable",
             ),
         ] {
-            let highlighted = highlight(language, source);
+            let mut highlighted = highlight(language, source);
             assert!(
-                has_token(&highlighted, 1, token, text),
+                has_token(&mut highlighted, 1, token, text),
                 "missing {text:?} in {language}: {:?}",
                 highlighted.line_spans(1)
             );
@@ -338,13 +495,13 @@ mod tests {
 
     #[test]
     fn typescript_keeps_ordinary_keywords() {
-        let h = highlight(
+        let mut h = highlight(
             "typescript",
             "const value: number = 1;\nfunction run() { return value; }\n",
         );
-        assert!(has_token(&h, 1, SyntaxToken::Keyword, "const"));
-        assert!(has_token(&h, 2, SyntaxToken::Keyword, "function"));
-        assert!(has_token(&h, 2, SyntaxToken::Keyword, "return"));
+        assert!(has_token(&mut h, 1, SyntaxToken::Keyword, "const"));
+        assert!(has_token(&mut h, 2, SyntaxToken::Keyword, "function"));
+        assert!(has_token(&mut h, 2, SyntaxToken::Keyword, "return"));
     }
 
     #[test]
@@ -380,15 +537,15 @@ mod tests {
     #[test]
     fn lua_predicates_filter_actual_captures() {
         let grammar = syntax_grammars::find("zig").unwrap();
-        let h = build(
+        let mut h = build_with_query(
             grammar.language(),
             "((identifier) @type (#lua-match? @type \"^[A-Z_][a-zA-Z0-9_]*\"))",
             b"const MyType = lower;\n".to_vec(),
         )
         .unwrap();
-        assert!(has_token(&h, 1, SyntaxToken::Type, "MyType"));
-        assert!(!has_token(&h, 1, SyntaxToken::Type, "lower"));
-        let malformed = build(
+        assert!(has_token(&mut h, 1, SyntaxToken::Type, "MyType"));
+        assert!(!has_token(&mut h, 1, SyntaxToken::Type, "lower"));
+        let mut malformed = build_with_query(
             grammar.language(),
             "((identifier) @type (#lua-match? @type))",
             b"const MyType = lower;".to_vec(),
@@ -411,9 +568,11 @@ mod tests {
             ("#future-directive! @type", vec!["UPPER", "lower", "Other"]),
         ] {
             let query = format!("((identifier) @type ({predicate}))");
-            let h = build(grammar.language(), &query, b"UPPER; lower; Other;".to_vec()).unwrap();
-            let captured: Vec<_> = h
-                .line_spans(1)
+            let mut h =
+                build_with_query(grammar.language(), &query, b"UPPER; lower; Other;".to_vec())
+                    .unwrap();
+            let spans = h.line_spans(1).to_vec();
+            let captured: Vec<_> = spans
                 .iter()
                 .map(|s| std::str::from_utf8(&h.source[s.start_byte..s.end_byte]).unwrap())
                 .collect();
@@ -423,15 +582,16 @@ mod tests {
 
     #[test]
     fn multiline_utf8_and_crlf_spans_stay_within_line_bytes() {
-        let h = highlight("rust", "/* 你好\r\n世界 */\r\nlet text = \"🦀\";\n");
+        let mut h = highlight("rust", "/* 你好\r\n世界 */\r\nlet text = \"🦀\";\n");
         assert_eq!(h.line_text(1), Some("/* 你好".as_bytes()));
         assert_eq!(h.line_text(2), Some("世界 */".as_bytes()));
         assert_eq!(h.line_text(3), Some("let text = \"🦀\";".as_bytes()));
-        assert!(has_token(&h, 1, SyntaxToken::Comment, "/* 你好"));
-        assert!(has_token(&h, 2, SyntaxToken::Comment, "世界 */"));
+        assert!(has_token(&mut h, 1, SyntaxToken::Comment, "/* 你好"));
+        assert!(has_token(&mut h, 2, SyntaxToken::Comment, "世界 */"));
         for line in 1..=3 {
+            let spans = h.line_spans(line).to_vec();
             let text = std::str::from_utf8(h.line_text(line).unwrap()).unwrap();
-            for span in h.line_spans(line) {
+            for span in spans {
                 assert!(text.get(span.start_byte..span.end_byte).is_some());
             }
         }
@@ -457,13 +617,15 @@ mod tests {
         }
         let grammar = syntax_grammars::find("zig").unwrap();
         assert!(matches!(
-            build(
+            build_with_query(
                 grammar.language(),
                 grammar.query,
                 vec![b' '; MAX_FILE_SIZE + 1]
             ),
             Err(Error::SourceTooLarge)
         ));
-        assert!(build(grammar.language(), grammar.query, vec![b' '; MAX_FILE_SIZE]).is_ok());
+        assert!(
+            build_with_query(grammar.language(), grammar.query, vec![b' '; MAX_FILE_SIZE]).is_ok()
+        );
     }
 }

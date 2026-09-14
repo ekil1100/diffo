@@ -128,7 +128,7 @@ impl Editor {
 
     pub fn draw(&self, terminal: Layout, ansi: Ansi, palette: ThemeTokens) -> String {
         let layout = EditorLayout::new(terminal);
-        if layout.width < 6 || layout.height < 4 {
+        if layout.width < 3 || layout.height == 0 {
             return String::new();
         }
         let rows = visual_lines(&self.body, layout.content_width);
@@ -138,31 +138,11 @@ impl Editor {
             .unwrap_or(rows.len() - 1);
         let first = (cursor_row + 1).saturating_sub(layout.body_rows);
         let mut out = String::new();
-        let pad_x = layout.x.min(8);
-        let pad_y = layout.y.min(1);
-        let panel_width = (layout.width + 2 * pad_x).min(terminal.width - (layout.x - pad_x));
-        let panel_height = (layout.height + pad_y + 1).min(terminal.height - (layout.y - pad_y));
-        for row in 0..panel_height {
-            put(
-                &mut out,
-                layout.x - pad_x,
-                layout.y - pad_y + row,
-                &style_cell("", panel_width, ansi, palette.bg_panel, palette.fg_default),
-            );
-        }
-        let border = format!("+{}+", "-".repeat(layout.width - 2));
         for row in 0..layout.height {
-            let raw = if row == 0 || row == layout.height - 1 {
-                border.clone()
-            } else {
-                let text = if row == layout.height - 2 {
-                    "Enter save  Shift+Enter newline  Esc cancel"
-                } else {
-                    rows.get(first + row - 1)
-                        .map_or("", |line| &self.body[line.start..line.end])
-                };
-                format!("|  {} |", fit_cell(text, layout.content_width))
-            };
+            let text = rows
+                .get(first + row)
+                .map_or("", |line| &self.body[line.start..line.end]);
+            let raw = format!(" {}", fit_cell(text, layout.content_width));
             put(
                 &mut out,
                 layout.x,
@@ -172,11 +152,7 @@ impl Editor {
                     layout.width,
                     ansi,
                     palette.bg_panel,
-                    if row == layout.height - 2 {
-                        palette.fg_muted
-                    } else {
-                        palette.fg_default
-                    },
+                    palette.fg_default,
                 ),
             );
         }
@@ -185,8 +161,8 @@ impl Editor {
             .min(layout.content_width);
         out.push_str(&format!(
             "\x1b[{};{}H\x1b[?25h",
-            layout.y + 2 + cursor_row - first,
-            layout.x + 4 + column
+            layout.y + 1 + cursor_row - first,
+            layout.x + 2 + column
         ));
         out
     }
@@ -207,15 +183,15 @@ struct EditorLayout {
 }
 impl EditorLayout {
     fn new(terminal: Layout) -> Self {
-        let width = terminal.width.saturating_sub(4).min(84);
-        let height = terminal.height.saturating_sub(2).min(14);
+        let width = terminal.main_width;
+        let height = terminal.dock_height.saturating_sub(1);
         Self {
-            x: (terminal.width - width) / 2,
-            y: (terminal.height - height) / 2,
+            x: terminal.main_x,
+            y: terminal.dock_y + 1,
             width,
             height,
-            content_width: width.saturating_sub(5),
-            body_rows: height.saturating_sub(3),
+            content_width: width.saturating_sub(2).max(1),
+            body_rows: height,
         }
     }
 }
@@ -325,11 +301,16 @@ mod tests {
     }
 
     #[test]
-    fn editor_floats_and_wraps_cjk_and_empty_tail() {
-        let l = EditorLayout::new(Layout::new(120, 40));
+    fn editor_docks_and_wraps_cjk_and_empty_tail() {
+        let state = super::super::State {
+            comment_open: true,
+            focus: super::super::Focus::Editor,
+            ..Default::default()
+        };
+        let l = EditorLayout::new(Layout::new(120, 40).with_panels(&state));
         assert_eq!(
             (l.x, l.y, l.width, l.height, l.content_width, l.body_rows),
-            (18, 13, 84, 14, 79, 11)
+            (0, 32, 120, 7, 118, 7)
         );
         let lines = visual_lines("架abc", 3);
         assert_eq!((lines[0].start, lines[0].end, lines[1].start), (0, 4, 4));
@@ -343,8 +324,13 @@ mod tests {
     fn editor_content_width_is_exact_and_cursor_tracks_tail() {
         let mut e = Editor::default();
         e.insert("架ab\nlast");
+        let state = super::super::State {
+            comment_open: true,
+            focus: super::super::Focus::Editor,
+            ..Default::default()
+        };
         let screen = e.draw(
-            Layout::new(60, 8),
+            Layout::new(60, 8).with_panels(&state),
             Ansi {
                 enabled: false,
                 true_color: false,
@@ -353,8 +339,9 @@ mod tests {
         );
         assert!(screen.contains("架ab"));
         assert!(screen.ends_with("\x1b[?25h"));
-        for line in screen.split('H').filter(|s| s.starts_with('|')) {
-            assert_eq!(display_width(line.split('\x1b').next().unwrap()), 56);
+        for line in screen.split('H').filter(|s| s.starts_with(' ')) {
+            assert_eq!(display_width(line.split('\x1b').next().unwrap()), 60);
         }
+        assert!(screen.starts_with("\x1b[6;1H"));
     }
 }

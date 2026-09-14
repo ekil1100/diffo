@@ -3,7 +3,6 @@ use crate::{
     diff::{DiffFile, DiffLine, DiffLineKind, DiffSnapshot},
     inline_diff::{self, Range},
     store::{Comment, Store},
-    syntax::{self, HighlightMode},
     syntax_cache::SyntaxCache,
     theme::{self, Ansi, Color, ThemeTokens},
     tui_text::{self, display_width, fit_cell},
@@ -26,6 +25,7 @@ use crossterm::{
     },
 };
 use std::{
+    collections::HashMap,
     io::{self, IsTerminal, Write},
     process::{Command, Stdio},
     sync::{
@@ -39,8 +39,28 @@ mod editor;
 #[cfg(unix)]
 #[path = "tui_input.rs"]
 mod input;
+#[path = "tui_screen.rs"]
+mod screen;
 
-const HELP: &str = "j/k arrows move  G/gg bottom/top  PgUp/PgDn scroll  J/K file  n/p change  C unfold/fold  z/Z folds  v view  r reviewed  c comment  V select  y copy  Esc clear  u unreviewed  ? help  q quit";
+const CURSOR_GUTTER: usize = 2;
+const HELP: &[&str] = &[
+    "HELP  Esc / ? close",
+    "",
+    "Tab          Open / close file navigation",
+    "j/k arrows   Move cursor; select a file in FILES",
+    "Enter        Open selected file / view comments",
+    "J/K          Next / previous file, keeping its position",
+    "n/p          Next / previous change",
+    "PgUp/PgDn    Page; scroll comments in COMMENTS",
+    "G/gg         Last / first line",
+    "c            Comment on cursor / selected code",
+    "V / Esc      Select range / clear selection",
+    "y            Copy cursor / selected diff",
+    "v            Stacked / split layout",
+    "C / z / Z    Fold mode / current fold / all folds",
+    "r / u        Mark reviewed / first unreviewed file",
+    "q / Ctrl+C   Quit",
+];
 // Request enhanced keys where supported; the input decoder also accepts legacy
 // modifyOtherKeys and Shift+Enter forms. Reset resources on leaving the editor.
 const ENABLE_EDITOR_KEYS: &str = "\x1b[>1u\x1b[>4;1f\x1b[>4;2m";
@@ -51,31 +71,48 @@ struct Layout {
     width: usize,
     height: usize,
     body_height: usize,
+    main_x: usize,
     main_width: usize,
-    sidebar_x: usize,
     sidebar_width: usize,
+    sidebar_overlay: bool,
+    dock_y: usize,
+    dock_height: usize,
 }
 impl Layout {
     fn new(width: usize, height: usize) -> Self {
         // Honor actual small terminals rather than writing outside their screen.
         let width = width.max(1);
         let height = height.max(3);
-        let sidebar_width = if width >= 120 {
-            (width / 4).clamp(36, 52)
-        } else if width >= 90 {
-            32
-        } else {
-            0
-        };
-        let main_width = width - sidebar_width - usize::from(sidebar_width > 0);
         Self {
             width,
             height,
             body_height: height - 2,
-            main_width,
-            sidebar_x: main_width + 1,
-            sidebar_width,
+            main_x: 0,
+            main_width: width,
+            sidebar_width: 0,
+            sidebar_overlay: false,
+            dock_y: height - 1,
+            dock_height: 0,
         }
+    }
+    fn with_panels(self, state: &State) -> Self {
+        let mut layout = Self::new(self.width, self.height);
+        if state.sidebar_open {
+            if self.width >= 112 {
+                layout.sidebar_width = (self.width / 4).clamp(26, 34);
+                layout.main_x = layout.sidebar_width + 1;
+                layout.main_width -= layout.main_x;
+            } else if state.focus == Focus::Files {
+                layout.sidebar_width = self.width;
+                layout.sidebar_overlay = true;
+            }
+        }
+        if state.comment_open && self.height >= 7 && !layout.sidebar_overlay {
+            layout.dock_height = (self.height / 3).clamp(3, 8);
+            layout.dock_y -= layout.dock_height;
+            layout.body_height -= layout.dock_height;
+        }
+        layout
     }
     fn terminal() -> Self {
         let (w, h) = terminal::size()
@@ -95,27 +132,74 @@ impl Layout {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Code,
+    Files,
+    Comments,
+    Editor,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadingPosition {
+    cursor: (usize, usize),
+    scroll: (usize, usize),
+    mode: ViewMode,
+    fold_mode: FoldMode,
+    width: usize,
+}
+impl ReadingPosition {
+    fn capture(state: &State, layout: Layout) -> Self {
+        Self {
+            cursor: (state.cursor_row, state.cursor_line),
+            scroll: (state.scroll_row, state.scroll_line),
+            mode: state.mode,
+            fold_mode: state.fold_mode,
+            width: layout.main_width,
+        }
+    }
+    fn restore(self, state: &mut State, layout: Layout) {
+        (state.cursor_row, state.cursor_line) = self.cursor;
+        (state.scroll_row, state.scroll_line) = self.scroll;
+        state.mode = self.mode;
+        state.fold_mode = self.fold_mode;
+        if self.width != layout.main_width {
+            state.cursor_line = 0;
+            state.scroll_line = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct State {
     active_file: usize,
     cursor_row: usize,
+    // Paging and wheel navigation can stop within a wrapped code row.
+    cursor_line: usize,
     scroll_row: usize,
-    // Allows scrolling within a single wrapped line taller than the viewport.
     scroll_line: usize,
     mode: ViewMode,
     fold_mode: FoldMode,
     selection_start: Option<usize>,
     notice: String,
     help: bool,
+    help_scroll: usize,
     pending: Option<char>,
     folds: Vec<FoldEntry>,
-    preserve_scroll_once: bool,
+    focus: Focus,
+    sidebar_open: bool,
+    file_cursor: usize,
+    comment_open: bool,
+    comment_scroll: usize,
+    dock_origin: Option<ReadingPosition>,
+    positions: HashMap<usize, ReadingPosition>,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
             active_file: 0,
             cursor_row: 0,
+            cursor_line: 0,
             scroll_row: 0,
             scroll_line: 0,
             mode: ViewMode::Stacked,
@@ -123,9 +207,16 @@ impl Default for State {
             selection_start: None,
             notice: String::new(),
             help: false,
+            help_scroll: 0,
             pending: None,
             folds: Vec::new(),
-            preserve_scroll_once: false,
+            focus: Focus::Code,
+            sidebar_open: false,
+            file_cursor: 0,
+            comment_open: false,
+            comment_scroll: 0,
+            dock_origin: None,
+            positions: HashMap::new(),
         }
     }
 }
@@ -140,14 +231,36 @@ impl State {
         )
     }
     fn selected(&self, row: usize) -> bool {
-        let start = self.selection_start.unwrap_or(self.cursor_row);
-        (start.min(self.cursor_row)..=start.max(self.cursor_row)).contains(&row)
+        self.selection_start.is_some_and(|start| {
+            (start.min(self.cursor_row)..=start.max(self.cursor_row)).contains(&row)
+        })
     }
     fn clear_selection(&mut self) {
         self.selection_start = None;
         self.notice.clear();
         self.help = false;
         self.pending = None;
+    }
+    fn open_comments(&mut self, focus: Focus, layout: Layout) {
+        if !self.comment_open {
+            self.dock_origin = Some(ReadingPosition::capture(self, layout));
+        }
+        self.comment_open = true;
+        self.comment_scroll = 0;
+        self.focus = focus;
+    }
+    fn close_comments(&mut self, layout: Layout) {
+        if let Some(origin) = self.dock_origin.take()
+            && origin.cursor == (self.cursor_row, self.cursor_line)
+            && origin.mode == self.mode
+            && origin.fold_mode == self.fold_mode
+            && origin.width == layout.main_width
+        {
+            (self.scroll_row, self.scroll_line) = origin.scroll;
+        }
+        self.comment_open = false;
+        self.comment_scroll = 0;
+        self.focus = Focus::Code;
     }
     fn set_fold(&mut self, id: FoldId, state: FoldState) {
         if let Some(entry) = self.folds.iter_mut().find(|entry| entry.id == id) {
@@ -187,6 +300,7 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
             }
         },
         palette: theme::catppuccin_mocha(),
+        screen: screen::Screen::default(),
     };
     if !interactive {
         let screen = renderer.frame(snapshot, store, &mut state, layout, false)?;
@@ -202,12 +316,15 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
         if terminal.interrupted.load(Ordering::Relaxed) {
             break;
         }
-        let layout = Layout::terminal();
+        let layout = Layout::terminal().with_panels(&state);
         let mut frame = renderer.frame(snapshot, store, &mut state, layout, true)?;
         if let Some(input) = &editor {
             frame.push_str(&input.draw(layout, renderer.ansi, renderer.palette));
+            renderer
+                .screen
+                .invalidate_rows(layout.dock_y + 1..layout.height - 1);
         }
-        // End synchronized output only after the overlay has been painted.
+        // End synchronized output only after the dock editor has been painted.
         frame.push_str("\x1b[?2026l");
         io::stdout().write_all(frame.as_bytes())?;
         io::stdout().flush()?;
@@ -237,6 +354,9 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
                 Err(e) => return Err(e.into()),
             }
         };
+        if matches!(event, Event::Resize(_, _)) {
+            renderer.screen.invalidate();
+        }
         if let Some(input) = editor.as_mut() {
             let action = match event {
                 Event::Key(key) => input.key(key),
@@ -260,6 +380,7 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
                             .into();
                     }
                     editor = None;
+                    state.close_comments(layout);
                     state.selection_start = None;
                     terminal.editor_keys(false)?;
                     execute!(io::stdout(), EnableMouseCapture, Hide)?;
@@ -299,7 +420,9 @@ pub fn run(snapshot: &DiffSnapshot, store: &mut Store, author: &str) -> Result<(
             },
             Event::Mouse(mouse) => handle_mouse(snapshot, store, &mut state, mouse, layout),
             Event::Resize(_, _) => {
+                state.cursor_line = 0;
                 state.scroll_line = 0;
+                state.selection_start = None;
             }
             _ => {}
         }
@@ -385,7 +508,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Drop also runs during unwinding, and setup failures retain this guard.
         if self.screen_active {
-            let _ = io::stdout().write_all(b"\x1b[?2026l\x1b[0m");
+            let _ = io::stdout().write_all(b"\x1b[?2026l\x1b[r\x1b[0m");
             let _ = self.editor_keys(false);
             let _ = execute!(
                 io::stdout(),
@@ -435,11 +558,38 @@ fn handle_key(
     if key.code == KeyCode::Char('q') {
         return Ok(KeyAction::Quit);
     }
+    let layout = layout.with_panels(state);
     if key.code == KeyCode::Esc {
+        if state.help {
+            state.help = false;
+        } else if state.focus == Focus::Files {
+            state.sidebar_open = false;
+            state.focus = Focus::Code;
+        } else if state.focus == Focus::Comments
+            || (state.selection_start.is_none() && state.comment_open)
+        {
+            state.close_comments(layout);
+        } else if state.selection_start.is_none() {
+            state.sidebar_open = false;
+        }
         state.clear_selection();
         return Ok(KeyAction::Continue);
     }
     if state.help && key.code != KeyCode::Char('?') {
+        let delta = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::PageDown => layout.height.saturating_sub(3) as isize,
+            KeyCode::PageUp => -(layout.height.saturating_sub(3) as isize),
+            _ => 0,
+        };
+        if delta != 0 {
+            state.help_scroll = state
+                .help_scroll
+                .saturating_add_signed(delta)
+                .min(HELP.len().saturating_sub(layout.height - 2));
+            return Ok(KeyAction::Continue);
+        }
         state.help = false;
         state.pending = None;
         state.notice.clear();
@@ -449,15 +599,80 @@ fn handle_key(
         state.notice.clear();
     }
     let pending = state.pending.take();
+    if key.code == KeyCode::Tab {
+        state.selection_start = None;
+        if state.focus == Focus::Files {
+            state.sidebar_open = false;
+            state.focus = Focus::Code;
+        } else {
+            state.sidebar_open = true;
+            state.file_cursor = state.active_file;
+            state.focus = Focus::Files;
+        }
+        return Ok(KeyAction::Continue);
+    }
+    if state.focus == Focus::Files {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                state.file_cursor = move_index(state.file_cursor, snapshot.files.len(), 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.file_cursor = move_index(state.file_cursor, snapshot.files.len(), -1)
+            }
+            KeyCode::PageDown => {
+                state.file_cursor = move_index(
+                    state.file_cursor,
+                    snapshot.files.len(),
+                    layout.height.saturating_sub(3) as isize,
+                )
+            }
+            KeyCode::PageUp => {
+                state.file_cursor = move_index(
+                    state.file_cursor,
+                    snapshot.files.len(),
+                    -(layout.height.saturating_sub(3) as isize),
+                )
+            }
+            KeyCode::Home => state.file_cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => state.file_cursor = snapshot.files.len() - 1,
+            KeyCode::Enter => open_file(snapshot, store, state, state.file_cursor, layout),
+            KeyCode::Char('?') => state.help = true,
+            _ => {}
+        }
+        return Ok(KeyAction::Continue);
+    }
+    if state.focus == Focus::Comments {
+        let delta = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::PageDown => layout.dock_height.saturating_sub(2).max(1) as isize,
+            KeyCode::PageUp => -(layout.dock_height.saturating_sub(2).max(1) as isize),
+            _ => 0,
+        };
+        if delta != 0 {
+            state.comment_scroll = state.comment_scroll.saturating_add_signed(delta);
+            return Ok(KeyAction::Continue);
+        }
+        match key.code {
+            KeyCode::Enter => state.focus = Focus::Code,
+            KeyCode::Home | KeyCode::Char('g') => state.comment_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => state.comment_scroll = usize::MAX,
+            KeyCode::Char('c' | '?' | 'J' | 'K') => {}
+            _ => return Ok(KeyAction::Continue),
+        }
+        if !matches!(key.code, KeyCode::Char('c' | '?' | 'J' | 'K')) {
+            return Ok(KeyAction::Continue);
+        }
+    }
     match key.code {
         KeyCode::Char('g') if pending != Some('g') => state.pending = Some('g'),
         KeyCode::Char('g') | KeyCode::Home => {
             state.cursor_row = 0;
-            state.scroll_line = 0;
+            state.cursor_line = 0;
         }
         KeyCode::Char('G') | KeyCode::End => {
             state.cursor_row = state.view(snapshot).rows.len().saturating_sub(1);
-            state.scroll_line = 0;
+            state.cursor_line = usize::MAX;
         }
         KeyCode::Char('[') => state.pending = Some('['),
         KeyCode::Char(']') => state.pending = Some(']'),
@@ -468,10 +683,22 @@ fn handle_key(
             if pending == Some('[') { -1 } else { 1 },
             layout,
         ),
-        KeyCode::Char('j') | KeyCode::Down => move_line(snapshot, store, state, 1, false, layout),
-        KeyCode::Char('k') | KeyCode::Up => move_line(snapshot, store, state, -1, false, layout),
-        KeyCode::PageDown => move_line(snapshot, store, state, 12, true, layout),
-        KeyCode::PageUp => move_line(snapshot, store, state, -12, true, layout),
+        KeyCode::Char('j') | KeyCode::Down => move_line(snapshot, state, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_line(snapshot, state, -1),
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let page = layout.body_height.saturating_sub(1).max(1) as isize;
+            move_visual(
+                snapshot,
+                store,
+                state,
+                if key.code == KeyCode::PageDown {
+                    page
+                } else {
+                    -page
+                },
+                layout,
+            );
+        }
         KeyCode::Char('J') => move_file(snapshot, store, state, 1, layout),
         KeyCode::Char('K') => move_file(snapshot, store, state, -1, layout),
         KeyCode::Char('n') | KeyCode::Char('p') => {
@@ -483,6 +710,7 @@ fn handle_key(
             };
             if let Some(row) = next {
                 state.cursor_row = row;
+                state.cursor_line = 0;
                 center(snapshot, store, &view, state, layout);
             }
         }
@@ -490,17 +718,40 @@ fn handle_key(
             toggle_folds(snapshot, store, state, key.code, layout)
         }
         KeyCode::Char('v') => {
+            let view = state.view(snapshot);
+            let anchor = capture_anchor(snapshot, store, &view, state, layout);
             state.selection_start = None;
             state.mode = if state.mode == ViewMode::Stacked {
                 ViewMode::Split
             } else {
                 ViewMode::Stacked
             };
-            state.scroll_line = 0;
+            let updated = state.view(snapshot);
+            restore_anchor(snapshot, store, &updated, state, anchor, layout);
         }
-        KeyCode::Char('V') => state.selection_start = Some(state.cursor_row),
+        KeyCode::Char('V') => {
+            state.selection_start = if state.selection_start.is_some() {
+                None
+            } else {
+                Some(state.cursor_row)
+            };
+        }
         KeyCode::Char('y') => return Ok(KeyAction::Copy),
-        KeyCode::Char('c') => return Ok(KeyAction::Comment),
+        KeyCode::Char('c') | KeyCode::Enter => {
+            let view = state.view(snapshot);
+            if comment_anchor(&snapshot.files[state.active_file], &view, state).is_some() {
+                if layout.height < 7 || layout.main_width < 20 {
+                    state.notice = "enlarge terminal to open comments".into();
+                } else if key.code == KeyCode::Char('c') {
+                    state.open_comments(Focus::Editor, layout);
+                    return Ok(KeyAction::Comment);
+                } else {
+                    state.open_comments(Focus::Comments, layout);
+                }
+            } else {
+                state.notice = "select a code line to comment".into();
+            }
+        }
         KeyCode::Char('?') => state.help = !state.help,
         KeyCode::Char('u') => {
             if let Some(index) = snapshot.files.iter().position(|file| {
@@ -510,9 +761,7 @@ fn handle_key(
                     &snapshot.review_target.target_id,
                 )
             }) {
-                state.active_file = index;
-                state.selection_start = None;
-                first_change(snapshot, store, state, layout);
+                open_file(snapshot, store, state, index, layout);
             }
         }
         KeyCode::Char('r') => {
@@ -532,14 +781,7 @@ fn handle_key(
         _ => {}
     }
     let view = state.view(snapshot);
-    ensure_visible(
-        snapshot,
-        store,
-        &view,
-        state,
-        layout,
-        !state.preserve_scroll_once,
-    );
+    ensure_visible(snapshot, store, &view, state, layout.with_panels(state));
     Ok(KeyAction::Continue)
 }
 
@@ -555,12 +797,45 @@ fn move_file(
     delta: isize,
     layout: Layout,
 ) {
-    state.active_file = move_index(state.active_file, snapshot.files.len(), delta);
+    let next = move_index(state.active_file, snapshot.files.len(), delta);
+    if next == state.active_file {
+        return;
+    }
+    open_file(snapshot, store, state, next, layout);
+}
+fn open_file(
+    snapshot: &DiffSnapshot,
+    store: &Store,
+    state: &mut State,
+    index: usize,
+    layout: Layout,
+) {
+    state.close_comments(layout);
+    state.focus = Focus::Code;
+    if layout.sidebar_overlay {
+        state.sidebar_open = false;
+    }
+    let layout = layout.with_panels(state);
     state.selection_start = None;
-    first_change(snapshot, store, state, layout);
+    state.file_cursor = index;
+    if index == state.active_file {
+        return;
+    }
+    state
+        .positions
+        .insert(state.active_file, ReadingPosition::capture(state, layout));
+    state.active_file = index;
+    if let Some(position) = state.positions.get(&index).copied() {
+        position.restore(state, layout);
+        let view = state.view(snapshot);
+        ensure_visible(snapshot, store, &view, state, layout);
+    } else {
+        first_change(snapshot, store, state, layout);
+    }
 }
 fn first_change(snapshot: &DiffSnapshot, store: &Store, state: &mut State, layout: Layout) -> bool {
     state.cursor_row = 0;
+    state.cursor_line = 0;
     state.scroll_row = 0;
     state.scroll_line = 0;
     let view = state.view(snapshot);
@@ -572,35 +847,28 @@ fn first_change(snapshot: &DiffSnapshot, store: &Store, state: &mut State, layou
         false
     }
 }
-fn move_line(
+fn move_line(snapshot: &DiffSnapshot, state: &mut State, delta: isize) {
+    let next = move_index(state.cursor_row, state.view(snapshot).rows.len(), delta);
+    if next != state.cursor_row {
+        state.cursor_row = next;
+        state.cursor_line = 0;
+    }
+}
+fn move_visual(
     snapshot: &DiffSnapshot,
     store: &Store,
     state: &mut State,
     delta: isize,
-    scroll: bool,
     layout: Layout,
 ) {
     let view = state.view(snapshot);
-    if view.rows.is_empty() {
-        return;
-    }
-    if scroll && state.cursor_row == state.scroll_row {
-        let height = row_height(snapshot, store, &view, state, state.cursor_row, layout);
-        let max_offset = height.saturating_sub(layout.body_height);
-        if (delta > 0 && state.scroll_line < max_offset) || (delta < 0 && state.scroll_line > 0) {
-            state.scroll_line = state
-                .scroll_line
-                .saturating_add_signed(delta)
-                .min(max_offset);
-            return;
-        }
-    }
-    state.cursor_row = move_index(state.cursor_row, view.rows.len(), delta);
-    state.scroll_line = 0;
-    if scroll {
-        state.scroll_row = move_index(state.scroll_row, view.rows.len(), delta);
-    }
-    ensure_visible(snapshot, store, &view, state, layout, true);
+    (state.cursor_row, state.cursor_line) = visual_position(
+        view.rows.len(),
+        (state.cursor_row, state.cursor_line),
+        delta,
+        |row| row_height(snapshot, store, &view, state, row, layout),
+    );
+    ensure_visible(snapshot, store, &view, state, layout);
 }
 fn file_tree_start(file_count: usize, active: usize, height: usize) -> usize {
     if height <= 2 || active < height - 1 {
@@ -616,13 +884,20 @@ fn handle_mouse(
     mouse: MouseEvent,
     layout: Layout,
 ) {
-    // Ignore motion-only events (crossterm enables all-motion tracking).
-    if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+    let layout = layout.with_panels(state);
+    // Ignore motion-only events and chrome outside the interactive body.
+    if state.help
+        || mouse.column as usize >= layout.width
+        || mouse.row < 1
+        || mouse.row as usize >= layout.height - 1
+        || matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_))
+    {
         return;
     }
     state.pending = None;
     state.notice.clear();
-    let sidebar = layout.sidebar_width > 0 && mouse.column as usize >= layout.sidebar_x;
+    let sidebar = (mouse.column as usize) < layout.sidebar_width;
+    let dock = !sidebar && layout.dock_height > 0 && mouse.row as usize >= layout.dock_y;
     let delta = match mouse.kind {
         MouseEventKind::ScrollUp => -3,
         MouseEventKind::ScrollDown => 3,
@@ -630,9 +905,14 @@ fn handle_mouse(
     };
     if delta != 0 {
         if sidebar {
-            move_file(snapshot, store, state, delta, layout);
+            state.focus = Focus::Files;
+            state.file_cursor = move_index(state.file_cursor, snapshot.files.len(), delta);
+        } else if dock {
+            state.focus = Focus::Comments;
+            state.comment_scroll = state.comment_scroll.saturating_add_signed(delta);
         } else {
-            move_line(snapshot, store, state, delta, true, layout);
+            state.focus = Focus::Code;
+            move_visual(snapshot, store, state, delta, layout);
         }
         return;
     }
@@ -649,25 +929,28 @@ fn handle_mouse(
             return;
         }
         let index =
-            file_tree_start(snapshot.files.len(), state.active_file, layout.body_height) + y - 2;
+            file_tree_start(snapshot.files.len(), state.file_cursor, layout.height - 2) + y - 2;
         if index < snapshot.files.len() {
-            state.active_file = index;
-            state.selection_start = None;
-            first_change(snapshot, store, state, layout);
+            open_file(snapshot, store, state, index, layout);
         }
-    } else {
+    } else if dock {
+        state.focus = Focus::Comments;
+    } else if mouse.column as usize >= layout.main_x {
+        state.focus = Focus::Code;
         let view = state.view(snapshot);
         if view.rows.is_empty() {
             return;
         }
-        let row = row_at_offset(snapshot, store, &view, state, y - 1, layout);
+        let (row, line) = row_at_offset(snapshot, store, &view, state, y - 1, layout);
         if drag {
             state.selection_start.get_or_insert(state.cursor_row);
         } else {
             state.selection_start = None;
         }
         state.cursor_row = row;
-        ensure_visible(snapshot, store, &view, state, layout, true);
+        state.cursor_line = line;
+        state.comment_scroll = 0;
+        ensure_visible(snapshot, store, &view, state, layout);
     }
 }
 
@@ -678,18 +961,6 @@ fn line_number(line: &DiffLine) -> Option<u32> {
         DiffLineKind::Context => line.new_lineno.or(line.old_lineno),
         DiffLineKind::Meta => None,
     }
-}
-fn number_width(file: &DiffFile) -> usize {
-    file.hunks
-        .iter()
-        .flat_map(|h| &h.lines)
-        .flat_map(|l| [l.old_lineno, l.new_lineno])
-        .flatten()
-        .max()
-        .unwrap_or(0)
-        .to_string()
-        .len()
-        .max(4)
 }
 fn wrap_widths(width: usize, prefix: usize, text: &str) -> (usize, usize, usize) {
     let indent: usize = text
@@ -739,27 +1010,27 @@ fn row_has_comment(row: &VisualRow<'_>, comment: &Comment, file: &DiffFile, targ
         .any(|line| comment_matches(comment, file, line, target))
 }
 fn row_height(
-    snapshot: &DiffSnapshot,
-    store: &Store,
+    _snapshot: &DiffSnapshot,
+    _store: &Store,
     view: &FileView<'_>,
-    state: &State,
+    _state: &State,
     index: usize,
     layout: Layout,
 ) -> usize {
-    let file = &snapshot.files[state.active_file];
     let row = &view.rows[index];
-    let digits = number_width(file);
-    let code_height = match row.kind {
+    let digits = view.line_number_width;
+    let width = layout.main_width.saturating_sub(CURSOR_GUTTER);
+    match row.kind {
         RowKind::StackedCode | RowKind::FileMeta => row
             .line
-            .map_or(1, |line| line_height(line, layout.main_width, digits + 5)),
-        RowKind::SplitCode if layout.main_width < 32 => row
+            .map_or(1, |line| line_height(line, width, digits + 5)),
+        RowKind::SplitCode if width < 32 => row
             .right
             .or(row.left)
-            .map_or(1, |line| line_height(line, layout.main_width, digits + 5)),
+            .map_or(1, |line| line_height(line, width, digits + 5)),
         RowKind::SplitCode => {
-            let left_width = (layout.main_width - 3) / 2;
-            let right_width = layout.main_width - 3 - left_width;
+            let left_width = (width - 3) / 2;
+            let right_width = width - 3 - left_width;
             row.left
                 .map_or(1, |line| line_height(line, left_width, digits + 4))
                 .max(
@@ -768,24 +1039,7 @@ fn row_height(
                 )
         }
         _ => 1,
-    };
-    if !state.selected(index)
-        || !matches!(
-            row.kind,
-            RowKind::StackedCode | RowKind::SplitCode | RowKind::FileMeta
-        )
-    {
-        return code_height;
     }
-    code_height
-        + store
-            .comments
-            .iter()
-            .filter(|comment| {
-                row_has_comment(row, comment, file, &snapshot.review_target.target_id)
-            })
-            .map(|comment| comment.body.split('\n').count())
-            .sum::<usize>()
 }
 fn height_between(
     snapshot: &DiffSnapshot,
@@ -800,26 +1054,52 @@ fn height_between(
         .map(|row| row_height(snapshot, store, view, state, row, layout))
         .sum()
 }
-fn scroll_for_offset(
-    snapshot: &DiffSnapshot,
-    store: &Store,
-    view: &FileView<'_>,
-    state: &State,
-    row: usize,
-    offset: usize,
-    layout: Layout,
-) -> usize {
-    let mut scroll = row;
-    let mut height = 0;
-    while scroll > 0 {
-        let previous = row_height(snapshot, store, view, state, scroll - 1, layout);
-        if height + previous > offset {
+// Cursor navigation, viewport following and mouse hit testing share visual geometry.
+fn visual_position(
+    len: usize,
+    position: (usize, usize),
+    delta: isize,
+    height: impl Fn(usize) -> usize,
+) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let (mut row, mut line) = position;
+    row = row.min(len - 1);
+    line = line.min(height(row).saturating_sub(1));
+    let mut remaining = delta.unsigned_abs();
+    while remaining > 0 {
+        let available = if delta > 0 {
+            height(row) - 1 - line
+        } else {
+            line
+        };
+        if remaining <= available {
+            line = if delta > 0 {
+                line + remaining
+            } else {
+                line - remaining
+            };
             break;
         }
-        height += previous;
-        scroll -= 1;
+        if delta > 0 && row + 1 == len {
+            line = height(row) - 1;
+            break;
+        }
+        if delta < 0 && row == 0 {
+            line = 0;
+            break;
+        }
+        remaining -= available + 1;
+        if delta > 0 {
+            row += 1;
+            line = 0;
+        } else {
+            row -= 1;
+            line = height(row) - 1;
+        }
     }
-    scroll
+    (row, line)
 }
 fn center(
     snapshot: &DiffSnapshot,
@@ -828,18 +1108,13 @@ fn center(
     state: &mut State,
     layout: Layout,
 ) {
-    state.scroll_row = scroll_for_offset(
-        snapshot,
-        store,
-        view,
-        state,
-        state.cursor_row,
-        layout.body_height / 2,
-        layout,
+    (state.scroll_row, state.scroll_line) = visual_position(
+        view.rows.len(),
+        (state.cursor_row, state.cursor_line),
+        -((layout.body_height / 2) as isize),
+        |row| row_height(snapshot, store, view, state, row, layout),
     );
-    state.scroll_line = 0;
-    state.preserve_scroll_once = true;
-    ensure_visible(snapshot, store, view, state, layout, false);
+    ensure_visible(snapshot, store, view, state, layout);
 }
 fn ensure_visible(
     snapshot: &DiffSnapshot,
@@ -847,62 +1122,51 @@ fn ensure_visible(
     view: &FileView<'_>,
     state: &mut State,
     layout: Layout,
-    fill_bottom: bool,
 ) {
     if view.rows.is_empty() {
         state.cursor_row = 0;
+        state.cursor_line = 0;
         state.scroll_row = 0;
         state.scroll_line = 0;
         return;
     }
     state.cursor_row = state.cursor_row.min(view.rows.len() - 1);
-    state.scroll_row = state.scroll_row.min(state.cursor_row);
-    if state.scroll_row < state.cursor_row {
-        state.scroll_line = 0;
-        // Only walk to the cursor until the screen is full.
-        let mut height = 0;
-        let mut overflow = false;
-        for index in state.scroll_row..=state.cursor_row {
-            height += row_height(snapshot, store, view, state, index, layout);
-            if height > layout.body_height {
-                overflow = true;
-                break;
-            }
-        }
-        if overflow {
-            let cursor_height = row_height(snapshot, store, view, state, state.cursor_row, layout);
-            state.scroll_row = scroll_for_offset(
-                snapshot,
-                store,
-                view,
-                state,
-                state.cursor_row,
-                layout.body_height.saturating_sub(cursor_height),
-                layout,
-            );
-        }
-    }
-    state.scroll_line = state.scroll_line.min(
-        row_height(snapshot, store, view, state, state.scroll_row, layout)
-            .saturating_sub(layout.body_height),
+    let cursor_height = row_height(snapshot, store, view, state, state.cursor_row, layout);
+    state.cursor_line = state.cursor_line.min(cursor_height - 1);
+    let height = |row| row_height(snapshot, store, view, state, row, layout);
+    let scroll = visual_position(
+        view.rows.len(),
+        (state.scroll_row, state.scroll_line),
+        0,
+        height,
     );
-    if fill_bottom && state.scroll_line == 0 {
-        let mut height = 0;
-        for row in state.scroll_row..view.rows.len() {
-            height += row_height(snapshot, store, view, state, row, layout);
-            if height >= layout.body_height {
-                break;
-            }
-        }
-        while state.scroll_row > 0 && height < layout.body_height {
-            let previous = row_height(snapshot, store, view, state, state.scroll_row - 1, layout);
-            if height + previous > layout.body_height {
-                break;
-            }
-            height += previous;
-            state.scroll_row -= 1;
-        }
-    }
+    // Keep ordinary rows whole; oversized rows follow the cursor's wrapped position.
+    let (first, last) = if cursor_height <= layout.body_height {
+        (0, cursor_height - 1)
+    } else {
+        (state.cursor_line, state.cursor_line)
+    };
+    let top = (state.cursor_row, first);
+    let bottom = (state.cursor_row, last);
+    let end = visual_position(
+        view.rows.len(),
+        scroll,
+        (layout.body_height - 1) as isize,
+        height,
+    );
+    let scroll = if top < scroll {
+        top
+    } else if bottom > end {
+        visual_position(
+            view.rows.len(),
+            bottom,
+            -((layout.body_height - 1) as isize),
+            height,
+        )
+    } else {
+        scroll
+    };
+    (state.scroll_row, state.scroll_line) = scroll;
 }
 fn row_at_offset(
     snapshot: &DiffSnapshot,
@@ -911,98 +1175,81 @@ fn row_at_offset(
     state: &State,
     offset: usize,
     layout: Layout,
-) -> usize {
-    let mut y = 0;
-    for row in state.scroll_row..view.rows.len() {
-        y += row_height(snapshot, store, view, state, row, layout);
-        if offset + state.scroll_line < y {
-            return row;
-        }
-    }
-    view.rows.len().saturating_sub(1)
+) -> (usize, usize) {
+    visual_position(
+        view.rows.len(),
+        (state.scroll_row, state.scroll_line),
+        offset as isize,
+        |row| row_height(snapshot, store, view, state, row, layout),
+    )
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CodeAnchor {
-    line: Option<String>,
-    left: Option<String>,
-    right: Option<String>,
+fn capture_anchor<'a>(
+    snapshot: &DiffSnapshot,
+    store: &Store,
+    view: &FileView<'a>,
+    state: &State,
+    layout: Layout,
+) -> Option<(VisualRow<'a>, usize)> {
+    let row = view.rows.get(state.cursor_row)?.clone();
+    let offset = height_between(
+        snapshot,
+        store,
+        view,
+        state,
+        state.scroll_row,
+        state.cursor_row,
+        layout,
+    )
+    .saturating_sub(state.scroll_line);
+    Some((row, offset))
 }
-fn code_anchor(row: &VisualRow<'_>) -> Option<CodeAnchor> {
-    if !matches!(row.kind, RowKind::StackedCode | RowKind::SplitCode) {
-        return None;
-    }
-    if row.line.is_none() && row.left.is_none() && row.right.is_none() {
-        return None;
-    }
-    Some(CodeAnchor {
-        line: row.line.map(|l| l.stable_line_id.clone()),
-        left: row.left.map(|l| l.stable_line_id.clone()),
-        right: row.right.map(|l| l.stable_line_id.clone()),
-    })
-}
-fn capture_anchor(
+fn restore_anchor(
     snapshot: &DiffSnapshot,
     store: &Store,
     view: &FileView<'_>,
-    state: &State,
+    state: &mut State,
+    anchor: Option<(VisualRow<'_>, usize)>,
     layout: Layout,
-) -> Option<(CodeAnchor, usize)> {
-    let capture = |index: usize| {
-        let anchor = code_anchor(view.rows.get(index)?)?;
-        let offset = if index < state.scroll_row {
-            0
-        } else {
-            height_between(
-                snapshot,
-                store,
-                view,
-                state,
-                state.scroll_row,
-                index,
-                layout,
-            )
-            .saturating_sub(state.scroll_line)
+) {
+    state.cursor_line = 0;
+    if let Some((original, offset)) = anchor {
+        let line = original
+            .comment_line()
+            .or_else(|| original.fold_lines.first());
+        let same_line = |candidate: &DiffLine| {
+            line.is_some_and(|line| line.stable_line_id == candidate.stable_line_id)
         };
-        Some((anchor, offset))
-    };
-    if let Some(anchor) = capture(state.cursor_row) {
-        return Some(anchor);
-    }
-    let skip = view
-        .rows
-        .get(state.cursor_row)
-        .filter(|r| r.kind == RowKind::Fold)
-        .and_then(|r| r.fold_id);
-    for index in state.cursor_row.max(state.scroll_row)..view.rows.len() {
-        let offset = height_between(
-            snapshot,
-            store,
-            view,
-            state,
-            state.scroll_row,
-            index,
-            layout,
-        )
-        .saturating_sub(state.scroll_line);
-        if offset >= layout.body_height {
-            break;
-        }
-        if skip.is_some() && view.rows[index].fold_id == skip {
-            continue;
-        }
-        if let Some(anchor) = capture(index) {
-            return Some(anchor);
-        }
-    }
-    for index in (state.scroll_row..state.cursor_row.min(view.rows.len())).rev() {
-        if let Some(anchor) = capture(index)
-            && anchor.1 < layout.body_height
-        {
-            return Some(anchor);
+        let index = view
+            .rows
+            .iter()
+            .position(|row| {
+                if original.kind == RowKind::Fold && row.kind == RowKind::Fold {
+                    row.fold_id == original.fold_id
+                } else if original.kind == RowKind::Fold && row.kind != RowKind::Fold
+                    || original.comment_line().is_some()
+                {
+                    [row.line, row.left, row.right]
+                        .into_iter()
+                        .flatten()
+                        .any(same_line)
+                } else {
+                    row.kind == original.kind && row.hunk_index == original.hunk_index
+                }
+            })
+            .or_else(|| {
+                view.rows.iter().position(|row| {
+                    row.kind == RowKind::Fold && row.fold_lines.iter().any(same_line)
+                })
+            });
+        if let Some(index) = index {
+            state.cursor_row = index;
+            (state.scroll_row, state.scroll_line) =
+                visual_position(view.rows.len(), (index, 0), -(offset as isize), |row| {
+                    row_height(snapshot, store, view, state, row, layout)
+                });
         }
     }
-    None
+    ensure_visible(snapshot, store, view, state, layout);
 }
 fn toggle_folds(
     snapshot: &DiffSnapshot,
@@ -1015,11 +1262,7 @@ fn toggle_folds(
         return;
     }
     let view = state.view(snapshot);
-    let target = view
-        .rows
-        .get(state.cursor_row)
-        .filter(|row| row.kind == RowKind::Fold)
-        .and_then(|row| row.fold_id);
+    let target = view.rows.get(state.cursor_row).and_then(|row| row.fold_id);
     if key == KeyCode::Char('z') && target.is_none() {
         return;
     }
@@ -1069,30 +1312,48 @@ fn toggle_folds(
         _ => return,
     }
     let updated = state.view(snapshot);
-    if let Some((anchor, offset)) = anchor
-        && let Some(index) = updated
-            .rows
-            .iter()
-            .position(|row| code_anchor(row).as_ref() == Some(&anchor))
-    {
-        state.cursor_row = index;
-        state.scroll_row =
-            scroll_for_offset(snapshot, store, &updated, state, index, offset, layout);
-        state.preserve_scroll_once = true;
-        ensure_visible(snapshot, store, &updated, state, layout, false);
-        return;
-    }
-    if let Some(id) = target
-        && let Some(index) = updated
-            .rows
-            .iter()
-            .position(|row| row.kind == RowKind::Fold && row.fold_id == Some(id))
-    {
-        state.cursor_row = index;
-    }
-    ensure_visible(snapshot, store, &updated, state, layout, true);
+    restore_anchor(snapshot, store, &updated, state, anchor, layout);
 }
 
+fn cursor_position(view: &FileView<'_>, state: &State) -> String {
+    view.rows
+        .get(state.cursor_row)
+        .map_or_else(String::new, |row| {
+            row.comment_line()
+                .and_then(|line| {
+                    line_number(line).map(|number| {
+                        format!(
+                            "{}:{number}",
+                            if line.kind == DiffLineKind::Delete {
+                                "old"
+                            } else {
+                                "new"
+                            },
+                        )
+                    })
+                })
+                .unwrap_or_else(|| {
+                    match row.kind {
+                        RowKind::FileHeader => "file",
+                        RowKind::HunkHeader => "hunk",
+                        RowKind::Fold => "fold",
+                        _ => "meta",
+                    }
+                    .into()
+                })
+        })
+}
+fn cursor_label(view: &FileView<'_>, state: &State) -> String {
+    let position = cursor_position(view, state);
+    if let Some(start) = state.selection_start {
+        format!(
+            "SELECT {} rows  {position}",
+            start.abs_diff(state.cursor_row) + 1
+        )
+    } else {
+        format!("CODE {position}")
+    }
+}
 fn display_path(file: &DiffFile) -> String {
     match &file.old_path {
         Some(old) if old != &file.path => format!("{old} -> {}", file.path),
@@ -1190,12 +1451,13 @@ fn comment_anchor<'a>(
         .min(view.rows.len() - 1);
     let anchor = |row: &VisualRow<'a>| {
         let line = row.comment_line()?;
+        let number = line_number(line)?;
         Some((
             line,
             row.hunk_index
                 .and_then(|i| file.hunks.get(i))
                 .map_or("", |h| h.header.as_str()),
-            line_number(line).unwrap_or(0),
+            number,
         ))
     };
     let mut selected = view.rows[start.min(cursor)..=start.max(cursor)]
@@ -1208,20 +1470,56 @@ fn comment_anchor<'a>(
             selected.next_back().map_or(end, |(_, _, end)| end),
         ));
     }
-    for distance in 0..view.rows.len() {
-        if let Some(found) = view.rows.get(cursor + distance).and_then(anchor) {
-            return Some(found);
-        }
-        if distance > 0
-            && let Some(found) = cursor
-                .checked_sub(distance)
-                .and_then(|index| view.rows.get(index))
-                .and_then(anchor)
+    None
+}
+fn comment_target_label(file: &DiffFile, view: &FileView<'_>, state: &State) -> String {
+    let Some((line, _, end)) = comment_anchor(file, view, state) else {
+        return "no code line".into();
+    };
+    let start = line_number(line).unwrap_or(0);
+    let side = if line.kind == DiffLineKind::Delete {
+        "old"
+    } else {
+        "new"
+    };
+    if start == end {
+        format!("{side}:{start}")
+    } else {
+        format!("{side}:{start}-{end}")
+    }
+}
+fn comment_rows(
+    snapshot: &DiffSnapshot,
+    store: &Store,
+    view: &FileView<'_>,
+    state: &State,
+    width: usize,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    let file = &snapshot.files[state.active_file];
+    if let Some(row) = view.rows.get(state.cursor_row) {
+        for comment in store
+            .comments
+            .iter()
+            .filter(|c| row_has_comment(row, c, file, &snapshot.review_target.target_id))
         {
-            return Some(found);
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            rows.push(plain_text(&format!(
+                "{} [{}]",
+                comment.author,
+                comment.match_status.label()
+            )));
+            for text in comment.body.split('\n') {
+                rows.extend(wrap_ansi(&plain_text(text), width, width));
+            }
         }
     }
-    None
+    if rows.is_empty() {
+        rows.push("No comments here. Press c to add one.".into());
+    }
+    rows
 }
 fn add_comment(
     snapshot: &DiffSnapshot,
@@ -1608,6 +1906,7 @@ struct Renderer {
     cache: SyntaxCache,
     ansi: Ansi,
     palette: ThemeTokens,
+    screen: screen::Screen,
 }
 impl Renderer {
     fn panel(&self, text: &str, width: usize, selected: bool) -> String {
@@ -1631,16 +1930,12 @@ impl Renderer {
         layout: Layout,
         interactive: bool,
     ) -> Result<String> {
+        let layout = layout.with_panels(state);
         let view = state.view(snapshot);
-        ensure_visible(
-            snapshot,
-            store,
-            &view,
-            state,
-            layout,
-            !state.preserve_scroll_once,
-        );
-        state.preserve_scroll_once = false;
+        // A picker must not move the code cursor or load the candidate file's syntax.
+        if !layout.sidebar_overlay && !state.help {
+            ensure_visible(snapshot, store, &view, state, layout);
+        }
         let file = &snapshot.files[state.active_file];
         let target = &snapshot.review_target.target_id;
         let reviewed = snapshot
@@ -1648,143 +1943,241 @@ impl Renderer {
             .iter()
             .filter(|file| store.is_reviewed(&file.path, &file.patch_fingerprint, target))
             .count();
-        let status = format!(
-            " diffo  {}  {}  files {}/{} reviewed  file {}/{}  {}",
-            snapshot.repository.current_branch,
-            snapshot.review_target.normalized_spec,
-            reviewed,
-            snapshot.files.len(),
-            state.active_file + 1,
-            snapshot.files.len(),
-            file.path
-        );
-        let mut lines = Vec::with_capacity(layout.height);
-        lines.push(style_cell(
-            &plain_text(&status),
-            layout.width,
-            self.ansi,
-            self.palette.bg_panel,
-            self.palette.fg_default,
+        let spec = if snapshot.review_target.normalized_spec.is_empty() {
+            "working tree"
+        } else {
+            &snapshot.review_target.normalized_spec
+        };
+        let right = plain_text(&format!(
+            "  {spec}  {}/{}  {reviewed}/{} reviewed ",
+            state.mode.label(),
+            state.fold_mode.label(),
+            snapshot.files.len()
         ));
+        let path = plain_text(&format!(" {}", display_path(file)));
+        let status = if layout.width >= 80 && display_width(&right) < layout.width / 2 {
+            format!(
+                "{}{right}",
+                fit_cell(&path, layout.width - display_width(&right))
+            )
+        } else {
+            format!("{path}  {right}")
+        };
+        let mut lines = vec![self.panel(&status, layout.width, false)];
         let mut diff_rows = Vec::new();
-        for index in state.scroll_row..view.rows.len() {
-            let rendered = self.row(snapshot, store, state, &view, index, layout.main_width)?;
-            let skip = if index == state.scroll_row {
-                state.scroll_line
-            } else {
-                0
-            };
-            diff_rows.extend(
-                rendered
-                    .into_iter()
-                    .skip(skip)
-                    .take(layout.body_height - diff_rows.len()),
-            );
-            if diff_rows.len() >= layout.body_height {
-                break;
+        if !layout.sidebar_overlay && !state.help {
+            for index in state.scroll_row..view.rows.len() {
+                let rendered = self.row(snapshot, store, state, &view, index, layout.main_width)?;
+                let skip = if index == state.scroll_row {
+                    state.scroll_line
+                } else {
+                    0
+                };
+                diff_rows.extend(
+                    rendered
+                        .into_iter()
+                        .skip(skip)
+                        .take(layout.body_height - diff_rows.len()),
+                );
+                if diff_rows.len() >= layout.body_height {
+                    break;
+                }
             }
         }
+        let comments = if layout.dock_height > 0 && state.focus != Focus::Editor {
+            comment_rows(
+                snapshot,
+                store,
+                &view,
+                state,
+                layout.main_width.saturating_sub(2).max(1),
+            )
+        } else {
+            Vec::new()
+        };
+        state.comment_scroll = state.comment_scroll.min(
+            comments
+                .len()
+                .saturating_sub(layout.dock_height.saturating_sub(1)),
+        );
+        let anchor = if state.focus == Focus::Editor {
+            comment_target_label(file, &view, state)
+        } else {
+            cursor_position(&view, state)
+        };
         let tree_start =
-            file_tree_start(snapshot.files.len(), state.active_file, layout.body_height);
-        for y in 0..layout.body_height {
-            let mut line = diff_rows.get(y).cloned().unwrap_or_else(|| {
-                style_cell(
-                    "",
-                    layout.main_width,
-                    self.ansi,
-                    self.palette.bg_default,
-                    self.palette.fg_default,
-                )
-            });
-            if layout.sidebar_width > 0 {
-                line.push_str(&style_cell(
-                    "│",
-                    1,
-                    self.ansi,
-                    self.palette.bg_default,
-                    self.palette.border,
+            file_tree_start(snapshot.files.len(), state.file_cursor, layout.height - 2);
+        for y in 0..layout.height - 2 {
+            if state.help {
+                lines.push(self.panel(
+                    HELP.get(state.help_scroll + y).copied().unwrap_or(""),
+                    layout.width,
+                    false,
                 ));
-                let tree = if y == 0 {
-                    self.panel(" files", layout.sidebar_width, false)
-                } else if let Some(file) = snapshot.files.get(tree_start + y - 1) {
-                    let index = tree_start + y - 1;
-                    let reviewed = store.is_reviewed(&file.path, &file.patch_fingerprint, target);
-                    let path = fit_cell(
-                        &plain_text(&file.path),
-                        layout.sidebar_width.saturating_sub(12),
-                    );
-                    let raw = format!(
-                        "{}{} {} {} ({})",
-                        if index == state.active_file { ">" } else { " " },
-                        file.status.label(),
-                        if reviewed { "x" } else { "." },
-                        path,
-                        store.comment_count(&file.path, target)
-                    );
-                    style_cell(
-                        &raw,
-                        layout.sidebar_width,
-                        self.ansi,
-                        if index == state.active_file {
-                            self.palette.bg_selected
-                        } else {
-                            self.palette.bg_default
-                        },
-                        if reviewed {
-                            self.palette.reviewed_badge
-                        } else {
-                            self.palette.unreviewed_badge
-                        },
-                    )
-                } else {
+                continue;
+            }
+            let mut line = String::new();
+            if layout.sidebar_width > 0 {
+                line.push_str(&self.file_row(
+                    snapshot,
+                    store,
+                    state,
+                    y,
+                    tree_start,
+                    layout.sidebar_width,
+                ));
+                if layout.sidebar_overlay {
+                    lines.push(line);
+                    continue;
+                }
+                line.push_str(&self.panel("│", 1, false));
+            }
+            let main = if y < layout.body_height {
+                diff_rows.get(y).cloned().unwrap_or_else(|| {
                     style_cell(
                         "",
-                        layout.sidebar_width,
+                        layout.main_width,
                         self.ansi,
                         self.palette.bg_default,
                         self.palette.fg_default,
                     )
+                })
+            } else if y == layout.body_height {
+                let title = if state.focus == Focus::Editor {
+                    "COMMENT"
+                } else {
+                    "COMMENTS"
                 };
-                line.push_str(&tree);
-            }
+                style_cell(
+                    &plain_text(&format!(" {title}  {anchor}  {}", file.path)),
+                    layout.main_width,
+                    self.ansi,
+                    self.palette.bg_selected,
+                    self.palette.fg_accent,
+                )
+            } else {
+                let text = comments
+                    .get(state.comment_scroll + y - layout.body_height - 1)
+                    .map_or("", String::as_str);
+                style_cell(
+                    &format!(" {text}"),
+                    layout.main_width,
+                    self.ansi,
+                    self.palette.bg_panel,
+                    self.palette.fg_default,
+                )
+            };
+            line.push_str(&main);
             lines.push(line);
         }
-        let syntax = if file.is_binary {
-            HighlightMode::Disabled
-        } else {
-            syntax::mode_for_language(file.language.as_deref())
-        };
-        let middle = format!(
-            "mode={}/{} target={} syntax={}",
-            state.mode.label(),
-            state.fold_mode.label(),
-            snapshot.review_target.normalized_spec,
-            syntax.label()
-        );
         let footer = if state.help {
-            HELP.into()
-        } else if state.notice.is_empty() {
-            format!("{middle}  ? help  C unfold/fold  z/Z folds  q quit")
+            "HELP  j/k scroll".into()
         } else {
-            format!("{}  {middle}  V select  y copy", state.notice)
-        };
-        lines.push(style_cell(
-            &plain_text(&footer),
-            layout.width,
-            self.ansi,
-            self.palette.bg_panel,
-            self.palette.fg_default,
-        ));
-        if interactive {
-            let mut out = String::from("\x1b[?2026h\x1b[?25l");
-            // Absolute positioning avoids raw-mode LF handling and last-column auto-wrap.
-            for (y, line) in lines.iter().enumerate() {
-                out.push_str(&format!("\x1b[{};1H{}\x1b[K", y + 1, line));
+            match state.focus {
+                Focus::Files => "FILES  j/k select  Enter open  ? help".into(),
+                Focus::Comments => "COMMENTS  j/k scroll  c comment  Enter code".into(),
+                Focus::Editor if layout.dock_height < 2 || layout.main_width < 3 => {
+                    "COMMENT  Enlarge terminal".into()
+                }
+                Focus::Editor => "COMMENT  Enter save  Shift+Enter newline".into(),
+                Focus::Code if layout.width < 80 => {
+                    format!("{}  Tab files  c comment", cursor_label(&view, state))
+                }
+                Focus::Code => format!(
+                    "{}  Tab files  Enter notes  c comment  V {}  y copy",
+                    cursor_label(&view, state),
+                    if state.selection_start.is_some() {
+                        "clear"
+                    } else {
+                        "select"
+                    }
+                ),
             }
-            Ok(out)
+        };
+        let footer = if state.notice.is_empty() {
+            footer
+        } else {
+            format!("{}  {footer}", state.notice)
+        };
+        let hint = if layout.width < 16 {
+            if state.focus == Focus::Code && !state.help {
+                "?"
+            } else {
+                "Esc"
+            }
+        } else if state.help || matches!(state.focus, Focus::Files | Focus::Comments) {
+            " Esc close"
+        } else if state.focus == Focus::Editor {
+            " Esc cancel"
+        } else {
+            " ? help"
+        };
+        let footer = format!(
+            "{}{hint}",
+            fit_cell(
+                &plain_text(&footer),
+                layout.width.saturating_sub(display_width(hint))
+            )
+        );
+        lines.push(self.panel(&footer, layout.width, false));
+        if interactive {
+            Ok(self
+                .screen
+                .draw(lines, layout.width, 1..layout.body_height + 1))
         } else {
             Ok(lines.join("\n"))
         }
+    }
+
+    fn file_row(
+        &self,
+        snapshot: &DiffSnapshot,
+        store: &Store,
+        state: &State,
+        y: usize,
+        start: usize,
+        width: usize,
+    ) -> String {
+        if y == 0 {
+            return self.panel(
+                &format!(" FILES  {}/{}", state.file_cursor + 1, snapshot.files.len()),
+                width,
+                false,
+            );
+        }
+        let index = start + y - 1;
+        let Some(file) = snapshot.files.get(index) else {
+            return self.panel("", width, false);
+        };
+        let target = &snapshot.review_target.target_id;
+        let reviewed = store.is_reviewed(&file.path, &file.patch_fingerprint, target);
+        let count = store.comment_count(&file.path, target);
+        let badge = if count > 0 {
+            format!(" !{count}")
+        } else {
+            String::new()
+        };
+        let focused = state.focus == Focus::Files && index == state.file_cursor;
+        let marker = if focused {
+            ">"
+        } else if index == state.active_file {
+            "*"
+        } else {
+            " "
+        };
+        let path = fit_cell(
+            &plain_text(&file.path),
+            width.saturating_sub(6 + display_width(&badge)),
+        );
+        self.panel(
+            &format!(
+                "{marker}{} {} {path}{badge}",
+                file.status.label(),
+                if reviewed { "x" } else { "." }
+            ),
+            width,
+            focused,
+        )
     }
     fn row(
         &mut self,
@@ -1796,21 +2189,29 @@ impl Renderer {
         width: usize,
     ) -> Result<Vec<String>> {
         let row = &view.rows[index];
-        let selected = state.selected(index);
+        let focused = index == state.cursor_row && state.focus == Focus::Code;
+        let selected = index == state.cursor_row || state.selected(index);
+        let gutter_width = width.min(CURSOR_GUTTER);
+        let width = width - gutter_width;
         let file = &snapshot.files[state.active_file];
         let target = &snapshot.review_target.target_id;
-        let mut rows = match row.kind {
+        let rows = match row.kind {
             RowKind::FileHeader => {
-                let path = plain_text(&display_path(file));
                 let stats = file_stats(view);
-                let gap = width
-                    .saturating_sub(2 + display_width(&path) + display_width(&stats) + 1)
-                    .max(1);
+                let count = store.comment_count(&file.path, target);
                 vec![style_cell(
-                    &format!("  {path}{}{stats} ", " ".repeat(gap)),
+                    &format!(
+                        "  {}  {stats}  {count} comment{}",
+                        file.status.label(),
+                        if count == 1 { "" } else { "s" }
+                    ),
                     width,
                     self.ansi,
-                    self.palette.bg_panel,
+                    if selected {
+                        self.palette.bg_selected
+                    } else {
+                        self.palette.bg_panel
+                    },
                     self.palette.fg_default,
                 )]
             }
@@ -1836,6 +2237,7 @@ impl Renderer {
                 target,
                 row.line,
                 width,
+                view.line_number_width,
                 selected,
                 true,
                 &[],
@@ -1847,6 +2249,7 @@ impl Renderer {
                 target,
                 row.right.or(row.left),
                 width,
+                view.line_number_width,
                 selected,
                 true,
                 &[],
@@ -1869,6 +2272,7 @@ impl Renderer {
                     target,
                     row.left,
                     left_width,
+                    view.line_number_width,
                     selected,
                     false,
                     pair.as_ref().map_or(&[], |p| &p.old),
@@ -1880,6 +2284,7 @@ impl Renderer {
                     target,
                     row.right,
                     right_width,
+                    view.line_number_width,
                     selected,
                     false,
                     pair.as_ref().map_or(&[], |p| &p.new),
@@ -1916,37 +2321,31 @@ impl Renderer {
                     .collect()
             }
         };
-        if selected
-            && matches!(
-                row.kind,
-                RowKind::StackedCode | RowKind::SplitCode | RowKind::FileMeta
-            )
-        {
-            for comment in &store.comments {
-                if !row_has_comment(row, comment, file, target) {
-                    continue;
-                }
-                for (i, text) in comment.body.split('\n').enumerate() {
-                    let raw = if i == 0 {
-                        format!(
-                            "  ! {} [{}] {text}",
-                            comment.author,
-                            comment.match_status.label()
-                        )
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(line, row)| {
+                let cursor = focused && line == state.cursor_line;
+                let gutter = style_cell(
+                    if cursor {
+                        "> "
+                    } else if state.selected(index) {
+                        "| "
                     } else {
-                        format!("    {text}")
-                    };
-                    rows.push(style_cell(
-                        &plain_text(&raw),
-                        width,
-                        self.ansi,
-                        self.palette.bg_panel,
-                        self.palette.comment_badge,
-                    ));
-                }
-            }
-        }
-        Ok(rows)
+                        "  "
+                    },
+                    gutter_width,
+                    self.ansi,
+                    self.palette.bg_panel,
+                    if cursor {
+                        self.palette.fg_accent
+                    } else {
+                        self.palette.fg_muted
+                    },
+                );
+                format!("{gutter}{row}")
+            })
+            .collect())
     }
     #[allow(clippy::too_many_arguments)]
     fn code_rows(
@@ -1957,6 +2356,7 @@ impl Renderer {
         target: &str,
         line: Option<&DiffLine>,
         width: usize,
+        digits: usize,
         selected: bool,
         stacked: bool,
         ranges: &[Range],
@@ -1970,7 +2370,6 @@ impl Renderer {
                 self.palette.fg_muted,
             )]);
         };
-        let digits = number_width(file);
         let label =
             line_number(line).map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"));
         let mark = if store
@@ -2092,6 +2491,7 @@ mod tests {
                 ),
                 ansi,
                 palette: theme::catppuccin_mocha(),
+                screen: screen::Screen::default(),
             }
         }
         fn row(&self, state: &State, text: &str) -> usize {
@@ -2131,18 +2531,458 @@ mod tests {
     fn layout_status_body_footer_and_sidebar_boundaries() {
         let l = Layout::new(100, 20);
         assert_eq!(
-            (l.body_height, l.main_width, l.sidebar_width, l.sidebar_x),
-            (18, 67, 32, 68)
+            (l.body_height, l.main_width, l.sidebar_width, l.main_x),
+            (18, 100, 0, 0)
         );
-        assert_eq!(Layout::new(89, 20).sidebar_width, 0);
-        assert_eq!(Layout::new(120, 20).sidebar_width, 36);
-        assert_eq!(Layout::new(300, 20).sidebar_width, 52);
+        let mut s = State {
+            sidebar_open: true,
+            ..State::default()
+        };
+        assert_eq!(Layout::new(89, 20).with_panels(&s).sidebar_width, 0);
+        let wide = Layout::new(120, 20).with_panels(&s);
+        assert_eq!(
+            (wide.sidebar_width, wide.main_x, wide.main_width),
+            (30, 31, 89)
+        );
+        assert_eq!(Layout::new(300, 20).with_panels(&s).sidebar_width, 34);
+        s.focus = Focus::Files;
+        let narrow = l.with_panels(&s);
+        assert!(narrow.sidebar_overlay);
+        assert_eq!(
+            (narrow.sidebar_width, narrow.main_width, narrow.main_x),
+            (100, 100, 0)
+        );
+        s.focus = Focus::Comments;
+        s.comment_open = true;
+        let dock = l.with_panels(&s);
+        assert_eq!(
+            (dock.body_height, dock.dock_y, dock.dock_height),
+            (12, 13, 6)
+        );
         assert_eq!(file_tree_start(20, 0, 5), 0);
         assert_eq!(file_tree_start(20, 3, 5), 0);
         assert_eq!(file_tree_start(20, 4, 5), 1);
         assert_eq!(file_tree_start(20, 4, 1), 0);
         assert_eq!(move_index(0, 0, -1), 0);
         assert_eq!(move_index(2, 4, isize::MAX), 3);
+    }
+
+    #[test]
+    fn file_picker_selects_without_opening_and_returns_to_code() {
+        let patch = format!(
+            "{}{}",
+            PATCH,
+            PATCH
+                .replace("sample.txt", "other.txt")
+                .replace("+new", "+candidate body")
+        );
+        let mut f = Fixture::new(&patch);
+        let mut s = State::default();
+        let l = Layout::new(120, 24);
+        s.cursor_row = f.row(&s, "three");
+        let cursor = s.cursor_row;
+        f.key(&mut s, KeyCode::Tab, l);
+        f.key(&mut s, KeyCode::Down, l);
+        assert_eq!((s.active_file, s.file_cursor, s.cursor_row), (0, 1, cursor));
+        let screen = f
+            .renderer(PLAIN)
+            .frame(&f.snapshot, &f.store, &mut s, l, false)
+            .unwrap();
+        assert!(screen.contains("FILES"));
+        assert!(!screen.contains("candidate body"));
+        assert_eq!(
+            screen.lines().filter(|line| line.starts_with('>')).count(),
+            1
+        );
+        f.key(&mut s, KeyCode::Enter, l);
+        assert_eq!((s.active_file, s.focus), (1, Focus::Code));
+        assert!(s.sidebar_open);
+        f.key(&mut s, KeyCode::Esc, l);
+        assert!(!s.sidebar_open);
+        let small = Layout::new(80, 24);
+        f.key(&mut s, KeyCode::Tab, small);
+        assert!(small.with_panels(&s).sidebar_overlay);
+        f.key(&mut s, KeyCode::Up, small);
+        assert_eq!(s.active_file, 1);
+        f.key(&mut s, KeyCode::Enter, small);
+        assert_eq!(s.active_file, 0);
+        assert_eq!(s.cursor_row, cursor);
+        assert!(!s.sidebar_open);
+    }
+
+    #[test]
+    fn returning_to_a_file_restores_cursor_scroll_layout_and_folds() {
+        let patch = long_patch(160, &[40, 120]);
+        let mut f = Fixture::new(&format!(
+            "{patch}{}",
+            patch.replace("sample.txt", "other.txt")
+        ));
+        let mut s = State {
+            mode: ViewMode::Split,
+            fold_mode: FoldMode::Fold,
+            ..State::default()
+        };
+        let l = Layout::new(140, 20);
+        f.key(&mut s, KeyCode::Char('Z'), l);
+        s.cursor_row = f.row(&s, "line 70");
+        let view = s.view(&f.snapshot);
+        center(&f.snapshot, &f.store, &view, &mut s, l);
+        let expected = ReadingPosition::capture(&s, l);
+        s.selection_start = Some(s.cursor_row - 1);
+        f.key(&mut s, KeyCode::Char('J'), l);
+        assert_eq!(s.selection_start, None);
+        f.key(&mut s, KeyCode::Char('v'), l);
+        f.key(&mut s, KeyCode::Char('C'), l);
+        f.key(&mut s, KeyCode::End, l);
+        let other = ReadingPosition::capture(&s, l);
+        f.key(&mut s, KeyCode::Char('K'), l);
+        assert_eq!((s.cursor_row, s.cursor_line), expected.cursor);
+        assert_eq!((s.scroll_row, s.scroll_line), expected.scroll);
+        assert_eq!((s.mode, s.fold_mode), (expected.mode, expected.fold_mode));
+        assert_eq!(
+            s.view(&f.snapshot).rows[s.cursor_row]
+                .comment_line()
+                .unwrap()
+                .text,
+            "line 70"
+        );
+        f.key(&mut s, KeyCode::Char('J'), l);
+        assert_eq!((s.cursor_row, s.cursor_line), other.cursor);
+        assert_eq!((s.scroll_row, s.scroll_line), other.scroll);
+        assert_eq!((s.mode, s.fold_mode), (other.mode, other.fold_mode));
+        f.key(&mut s, KeyCode::Char('K'), Layout::new(80, 12));
+        assert_eq!(s.cursor_row, expected.cursor.0);
+        assert_eq!(s.cursor_line, 0);
+        assert!(f.store.comments.is_empty());
+    }
+
+    #[test]
+    fn closing_comments_restores_the_viewport_and_keeps_the_anchor() {
+        let mut f = Fixture::new(&long_patch(100, &[80]));
+        let l = Layout::new(100, 20);
+        let mut s = State::default();
+        s.cursor_row = f.row(&s, "line 80 changed");
+        s.scroll_row = s.cursor_row - (l.body_height - 1);
+        let original = ReadingPosition::capture(&s, l);
+        f.key(&mut s, KeyCode::Enter, l);
+        assert_eq!(s.focus, Focus::Comments);
+        f.renderer(PLAIN)
+            .frame(&f.snapshot, &f.store, &mut s, l, false)
+            .unwrap();
+        assert!(s.scroll_row > original.scroll.0);
+        f.key(&mut s, KeyCode::End, l);
+        assert_eq!(s.cursor_row, original.cursor.0);
+        f.key(&mut s, KeyCode::Esc, l);
+        assert_eq!((s.scroll_row, s.scroll_line), original.scroll);
+        s.selection_start = Some(s.cursor_row - 2);
+        assert_eq!(f.key(&mut s, KeyCode::Char('c'), l), KeyAction::Comment);
+        assert_eq!(s.focus, Focus::Editor);
+        let view = s.view(&f.snapshot);
+        assert!(comment_target_label(&f.snapshot.files[0], &view, &s).contains('-'));
+        assert!(s.selection_start.is_some());
+        assert_eq!(s.cursor_row, original.cursor.0);
+    }
+
+    #[test]
+    fn panels_and_dock_frames_fit_narrow_short_and_wide_terminals() {
+        let mut f = Fixture::new(PATCH);
+        for width in [1, 19, 40, 60, 80, 100, 112, 160] {
+            for height in [3, 6, 7, 12, 24] {
+                for focus in [Focus::Code, Focus::Files, Focus::Comments, Focus::Editor] {
+                    let mut s = State {
+                        sidebar_open: true,
+                        comment_open: true,
+                        focus,
+                        ..State::default()
+                    };
+                    s.cursor_row = f.row(&s, "new");
+                    let base = Layout::new(width, height);
+                    let l = base.with_panels(&s);
+                    assert_eq!(l.body_height + l.dock_height + 2, l.height);
+                    assert_eq!(l.dock_y, l.body_height + 1);
+                    assert_eq!(l.main_x + l.main_width, l.width);
+                    let frame = f
+                        .renderer(PLAIN)
+                        .frame(&f.snapshot, &f.store, &mut s, base, false)
+                        .unwrap();
+                    assert_eq!(frame.lines().count(), height);
+                    assert!(
+                        frame.lines().all(|line| display_width(line) == width),
+                        "{width}x{height}, {focus:?}"
+                    );
+                    assert!(!frame.contains('\x1b'));
+                    if width >= 19 {
+                        let hint = match focus {
+                            Focus::Code => "? help",
+                            Focus::Editor => "Esc cancel",
+                            _ => "Esc close",
+                        };
+                        assert!(
+                            frame.lines().last().unwrap().ends_with(hint),
+                            "{width}x{height}: {hint}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut s = State::default();
+        s.cursor_row = f.row(&s, "new");
+        assert_eq!(
+            f.key(&mut s, KeyCode::Char('c'), Layout::new(19, 6)),
+            KeyAction::Continue
+        );
+        assert!(!s.comment_open);
+        assert!(s.notice.contains("enlarge"));
+        s.help = true;
+        f.key(&mut s, KeyCode::PageDown, Layout::new(80, 8));
+        let screen = f
+            .renderer(PLAIN)
+            .frame(&f.snapshot, &f.store, &mut s, Layout::new(80, 8), false)
+            .unwrap();
+        assert!(s.help_scroll > 0);
+        assert!(screen.contains("HELP  j/k scroll"));
+    }
+
+    #[test]
+    fn visual_positions_match_flat_screen_coordinates() {
+        let heights = [1, 4, 2, 10];
+        let positions: Vec<_> = heights
+            .iter()
+            .enumerate()
+            .flat_map(|(row, &height)| (0..height).map(move |line| (row, line)))
+            .collect();
+        for (index, &position) in positions.iter().enumerate() {
+            for delta in [isize::MIN, -8, -1, 0, 1, 8, isize::MAX] {
+                assert_eq!(
+                    visual_position(heights.len(), position, delta, |row| heights[row]),
+                    positions[move_index(index, positions.len(), delta)],
+                );
+            }
+        }
+        assert_eq!(
+            visual_position(0, (10, 10), 1, |_| panic!("empty view")),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn cursor_moves_before_viewport_and_does_not_scroll_on_redraw() {
+        let mut f = Fixture::new(&long_patch(60, &[30]));
+        let l = Layout::new(80, 12);
+        let mut s = State::default();
+        f.key(&mut s, KeyCode::Down, l);
+        assert_eq!(s.cursor_row, 1);
+        assert_eq!((s.scroll_row, s.scroll_line), (0, 0));
+        move_visual(&f.snapshot, &f.store, &mut s, 3, l);
+        assert_eq!(s.cursor_row, 4);
+        assert_eq!((s.scroll_row, s.scroll_line), (0, 0));
+        for _ in 0..6 {
+            f.key(&mut s, KeyCode::Char('j'), l);
+        }
+        assert_eq!(s.cursor_row, 10);
+        assert_eq!((s.scroll_row, s.scroll_line), (1, 0));
+        f.key(&mut s, KeyCode::Char('k'), l);
+        assert_eq!((s.scroll_row, s.scroll_line), (1, 0));
+        let view = s.view(&f.snapshot);
+        s.cursor_row = view.rows.len() - 2;
+        center(&f.snapshot, &f.store, &view, &mut s, l);
+        let scroll = (s.scroll_row, s.scroll_line);
+        let cursor = s.cursor_row;
+        f.renderer(PLAIN)
+            .frame(&f.snapshot, &f.store, &mut s, l, false)
+            .unwrap();
+        assert_eq!((s.scroll_row, s.scroll_line), scroll);
+        f.key(&mut s, KeyCode::Char('V'), l);
+        assert_eq!((s.scroll_row, s.scroll_line), scroll);
+        f.key(&mut s, KeyCode::Char('J'), l);
+        assert_eq!(s.cursor_row, cursor);
+        assert!(s.selection_start.is_some());
+    }
+
+    #[test]
+    fn page_navigation_uses_screen_height_and_wrapped_positions() {
+        let mut f = Fixture::new(&long_patch(100, &[80]));
+        for height in [8, 12, 24] {
+            let l = Layout::new(80, height);
+            let mut s = State {
+                cursor_row: 1,
+                ..State::default()
+            };
+            f.key(&mut s, KeyCode::PageDown, l);
+            assert_eq!(s.cursor_row, l.body_height);
+            f.key(&mut s, KeyCode::PageUp, l);
+            assert_eq!((s.cursor_row, s.cursor_line), (1, 0));
+        }
+        let mut f = Fixture::new(&PATCH.replace("+new", &format!("+{}TAIL", "word ".repeat(250))));
+        for mode in [ViewMode::Stacked, ViewMode::Split] {
+            let l = Layout::new(40, 8);
+            let mut s = State {
+                mode,
+                ..State::default()
+            };
+            s.cursor_row = s
+                .view(&f.snapshot)
+                .rows
+                .iter()
+                .position(|row| {
+                    row.comment_line()
+                        .is_some_and(|line| line.text.ends_with("TAIL"))
+                })
+                .unwrap();
+            let row = s.cursor_row;
+            f.key(&mut s, KeyCode::PageDown, l);
+            assert_eq!((s.cursor_row, s.cursor_line), (row, l.body_height - 1));
+            f.key(&mut s, KeyCode::PageDown, l);
+            assert_eq!(
+                (s.cursor_row, s.cursor_line),
+                (row, 2 * (l.body_height - 1))
+            );
+            assert!(s.scroll_line > 0);
+            let frame = f
+                .renderer(PLAIN)
+                .frame(&f.snapshot, &f.store, &mut s, l, false)
+                .unwrap();
+            assert_eq!(
+                frame.lines().filter(|line| line.starts_with("> ")).count(),
+                1
+            );
+            f.key(&mut s, KeyCode::PageUp, l);
+            f.key(&mut s, KeyCode::PageUp, l);
+            assert_eq!((s.cursor_row, s.cursor_line), (row, 0));
+        }
+    }
+
+    #[test]
+    fn cursor_and_selection_have_distinct_markers_without_color() {
+        let mut f = Fixture::new(PATCH);
+        let l = Layout::new(100, 12);
+        let mut s = State::default();
+        s.cursor_row = f.row(&s, "new");
+        let start = s.cursor_row;
+        assert!(!s.selected(start));
+        for ansi in [PLAIN, ANSI] {
+            let mut renderer = f.renderer(ansi);
+            let view = s.view(&f.snapshot);
+            let row = renderer
+                .row(&f.snapshot, &f.store, &s, &view, start, l.main_width)
+                .unwrap();
+            assert!(plain_text(&row[0]).starts_with("> "));
+        }
+        f.key(&mut s, KeyCode::Char('V'), l);
+        f.key(&mut s, KeyCode::Char('j'), l);
+        let view = s.view(&f.snapshot);
+        let mut renderer = f.renderer(PLAIN);
+        assert!(
+            renderer
+                .row(&f.snapshot, &f.store, &s, &view, start, l.main_width)
+                .unwrap()[0]
+                .starts_with("| ")
+        );
+        assert!(
+            renderer
+                .row(&f.snapshot, &f.store, &s, &view, s.cursor_row, l.main_width)
+                .unwrap()[0]
+                .starts_with("> ")
+        );
+        assert!(
+            renderer
+                .frame(&f.snapshot, &f.store, &mut s, l, false)
+                .unwrap()
+                .contains("SELECT 2 rows")
+        );
+        assert_eq!(selected_text(&f.snapshot, &s), ("+new\n+three".into(), 2));
+        f.key(&mut s, KeyCode::Char('V'), l);
+        assert_eq!(s.selection_start, None);
+        assert!(
+            renderer
+                .frame(&f.snapshot, &f.store, &mut s, l, false)
+                .unwrap()
+                .contains("CODE new:3")
+        );
+        f.key(&mut s, KeyCode::Home, l);
+        assert_eq!(f.key(&mut s, KeyCode::Char('c'), l), KeyAction::Continue);
+        assert_eq!(s.notice, "select a code line to comment");
+        assert!(f.store.comments.is_empty());
+        let view = s.view(&f.snapshot);
+        assert!(
+            renderer
+                .row(&f.snapshot, &f.store, &s, &view, 0, l.main_width)
+                .unwrap()[0]
+                .starts_with("> ")
+        );
+    }
+
+    #[test]
+    fn layout_and_fold_changes_keep_the_cursor_source_position() {
+        let mut f = Fixture::new(&long_patch(100, &[10, 30, 70]));
+        let l = Layout::new(100, 20);
+        for text in ["line 30 changed", "line 65"] {
+            let mut s = State::default();
+            s.cursor_row = f.row(&s, text);
+            let id = s.view(&f.snapshot).rows[s.cursor_row]
+                .comment_line()
+                .unwrap()
+                .stable_line_id
+                .clone();
+            for _ in 0..2 {
+                f.key(&mut s, KeyCode::Char('v'), l);
+                assert_eq!(
+                    s.view(&f.snapshot).rows[s.cursor_row]
+                        .comment_line()
+                        .unwrap()
+                        .stable_line_id,
+                    id
+                );
+            }
+        }
+        let mut s = State::default();
+        s.cursor_row = f.row(&s, "line 50");
+        f.key(&mut s, KeyCode::Char('C'), l);
+        let row = s.view(&f.snapshot).rows[s.cursor_row].clone();
+        assert_eq!(row.kind, RowKind::Fold);
+        assert!(row.fold_lines.iter().any(|line| line.text == "line 50"));
+        let id = row.fold_id;
+        f.key(&mut s, KeyCode::Char('v'), l);
+        assert_eq!(s.view(&f.snapshot).rows[s.cursor_row].fold_id, id);
+        f.key(&mut s, KeyCode::Char('z'), l);
+        assert_eq!(s.view(&f.snapshot).rows[s.cursor_row].fold_id, id);
+        s.cursor_row = f.row(&s, "line 70 changed");
+        f.key(&mut s, KeyCode::Char('Z'), l);
+        assert_eq!(
+            s.view(&f.snapshot).rows[s.cursor_row]
+                .comment_line()
+                .unwrap()
+                .text,
+            "line 70 changed"
+        );
+    }
+
+    #[test]
+    fn selection_only_previews_comments_at_the_cursor() {
+        let mut f = Fixture::new(PATCH);
+        let mut s = State::default();
+        let l = Layout::new(80, 12);
+        s.cursor_row = f.row(&s, "new");
+        add_comment(&f.snapshot, &mut f.store, &s, "preview", "tester").unwrap();
+        let start = s.cursor_row;
+        f.key(&mut s, KeyCode::Char('V'), l);
+        f.key(&mut s, KeyCode::Char('j'), l);
+        let view = s.view(&f.snapshot);
+        assert!(s.selected(start));
+        assert_eq!(row_height(&f.snapshot, &f.store, &view, &s, start, l), 1);
+        let row = f
+            .renderer(PLAIN)
+            .row(&f.snapshot, &f.store, &s, &view, start, l.main_width)
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        assert!(!row[0].contains("preview"));
+        f.key(&mut s, KeyCode::Enter, l);
+        let frame = f
+            .renderer(PLAIN)
+            .frame(&f.snapshot, &f.store, &mut s, l, false)
+            .unwrap();
+        assert!(frame.contains("COMMENTS  new:3"));
+        assert!(!frame.contains("preview"));
     }
 
     #[test]
@@ -2275,7 +3115,7 @@ mod tests {
         s.selection_start = Some(0);
         s.notice = "copied".into();
         s.pending = Some('g');
-        f.key(&mut s, KeyCode::Char('j'), l);
+        f.key(&mut s, KeyCode::Char('x'), l);
         assert_eq!(s.cursor_row, 1);
         assert!(!s.help);
         assert_eq!(s.selection_start, Some(0));
@@ -2327,7 +3167,7 @@ mod tests {
     }
 
     #[test]
-    fn comment_selection_persists_both_directions_and_nearest_header() {
+    fn comment_selection_persists_both_directions_without_nearest_line_fallback() {
         for reverse in [false, true] {
             let mut f = Fixture::new(PATCH);
             let mut s = State::default();
@@ -2362,14 +3202,14 @@ mod tests {
             s.cursor_row = 0;
             s.selection_start = None;
             assert!(
-                add_comment(&f.snapshot, &mut f.store, &s, "header comment", "tester").unwrap()
+                !add_comment(&f.snapshot, &mut f.store, &s, "header comment", "tester").unwrap()
             );
-            assert_eq!(f.store.comments[1].start_line, 1);
+            assert_eq!(f.store.comments.len(), 1);
         }
     }
 
     #[test]
-    fn selected_comment_preview_and_height_match_renderer_and_mouse() {
+    fn comments_only_render_in_the_dock_and_do_not_change_code_geometry() {
         let mut f = Fixture::new(PATCH);
         let mut s = State::default();
         let l = Layout::new(80, 12);
@@ -2391,9 +3231,8 @@ mod tests {
             rendered.len(),
             row_height(&f.snapshot, &f.store, &view, &s, s.cursor_row, l)
         );
-        assert_eq!(rendered.len(), 3);
+        assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains('!'));
-        assert!(rendered[1].contains("tester [exact] history body"));
         let offset = height_between(
             &f.snapshot,
             &f.store,
@@ -2404,13 +3243,40 @@ mod tests {
             l,
         );
         assert_eq!(
-            row_at_offset(&f.snapshot, &f.store, &view, &s, offset + 2, l),
-            s.cursor_row
+            row_at_offset(&f.snapshot, &f.store, &view, &s, offset + 1, l),
+            (s.cursor_row + 1, 0)
         );
         let screen = renderer
             .frame(&f.snapshot, &f.store, &mut s, l, false)
             .unwrap();
+        assert!(!screen.contains("history body"));
+        let cursor = s.cursor_row;
+        f.key(&mut s, KeyCode::Enter, l);
+        assert_eq!(s.focus, Focus::Comments);
+        let screen = renderer
+            .frame(&f.snapshot, &f.store, &mut s, l, false)
+            .unwrap();
+        let dock = l.with_panels(&s);
+        assert_eq!(s.cursor_row, cursor);
+        assert!(
+            screen
+                .lines()
+                .nth(dock.dock_y)
+                .unwrap()
+                .contains("COMMENTS  new:2")
+        );
+        assert!(
+            screen
+                .lines()
+                .nth(dock.dock_y + 1)
+                .unwrap()
+                .contains("tester [exact]")
+        );
         assert!(screen.contains("history body"));
+        f.key(&mut s, KeyCode::Char('j'), l);
+        assert_eq!(s.cursor_row, cursor);
+        f.key(&mut s, KeyCode::Esc, l);
+        assert!(!s.comment_open);
         s.cursor_row = 0;
         assert!(
             !renderer
@@ -2469,16 +3335,16 @@ mod tests {
     }
 
     #[test]
-    fn fold_toggle_requires_fold_row_and_keeps_visible_code_offset() {
+    fn fold_toggle_keeps_cursor_on_fold_and_collapses_from_its_context() {
         for mode in [ViewMode::Stacked, ViewMode::Split] {
-            let f = Fixture::new(&long_patch(130, &[118]));
+            let mut f = Fixture::new(&long_patch(130, &[118]));
             let l = Layout::new(80, 24);
             let mut s = State {
                 mode,
                 fold_mode: FoldMode::Fold,
                 ..State::default()
             };
-            toggle_folds(&f.snapshot, &f.store, &mut s, KeyCode::Char('z'), l);
+            f.key(&mut s, KeyCode::Char('z'), l);
             assert!(s.folds.is_empty());
             assert_eq!(s.cursor_row, 0);
             let view = s.view(&f.snapshot);
@@ -2487,43 +3353,34 @@ mod tests {
                 .iter()
                 .position(|r| r.kind == RowKind::Fold)
                 .unwrap();
-            let code_row = f.row(&s, "line 115");
-            let offset = height_between(&f.snapshot, &f.store, &view, &s, 0, code_row, l);
+            let id = view.rows[fold_row].fold_id;
             s.cursor_row = fold_row;
-            toggle_folds(&f.snapshot, &f.store, &mut s, KeyCode::Char('z'), l);
+            f.key(&mut s, KeyCode::Char('z'), l);
             let updated = s.view(&f.snapshot);
+            assert_eq!(s.cursor_row, fold_row);
+            assert_eq!(updated.rows[s.cursor_row].fold_id, id);
+            assert!(updated.rows[s.cursor_row].fold_expanded);
+            f.key(&mut s, KeyCode::Char('j'), l);
             assert_eq!(
-                updated.rows[s.cursor_row].comment_line().unwrap().text,
-                "line 115"
+                s.view(&f.snapshot).rows[s.cursor_row]
+                    .comment_line()
+                    .unwrap()
+                    .text,
+                "line 1"
             );
+            f.key(&mut s, KeyCode::Char('z'), l);
+            assert_eq!(s.cursor_row, fold_row);
+            assert!(!s.view(&f.snapshot).rows[s.cursor_row].fold_expanded);
+            f.key(&mut s, KeyCode::Char('C'), l);
             assert_eq!(
-                height_between(
-                    &f.snapshot,
-                    &f.store,
-                    &updated,
-                    &s,
-                    s.scroll_row,
-                    s.cursor_row,
-                    l
-                ),
-                offset
+                s.view(&f.snapshot).rows[s.cursor_row]
+                    .comment_line()
+                    .unwrap()
+                    .text,
+                "line 1"
             );
-            let mut renderer = f.renderer(PLAIN);
-            renderer
-                .frame(&f.snapshot, &f.store, &mut s, l, false)
-                .unwrap();
-            assert_eq!(
-                height_between(
-                    &f.snapshot,
-                    &f.store,
-                    &updated,
-                    &s,
-                    s.scroll_row,
-                    s.cursor_row,
-                    l
-                ),
-                offset
-            );
+            f.key(&mut s, KeyCode::Char('C'), l);
+            assert_eq!(s.view(&f.snapshot).rows[s.cursor_row].fold_id, id);
         }
     }
 
@@ -2538,12 +3395,10 @@ mod tests {
         };
         toggle_folds(&f.snapshot, &f.store, &mut s, KeyCode::Char('Z'), l);
         assert_eq!(s.selection_start, None);
+        assert_eq!(s.cursor_row, 0);
         assert_eq!(
-            s.view(&f.snapshot).rows[s.cursor_row]
-                .comment_line()
-                .unwrap()
-                .text,
-            "line 115"
+            s.view(&f.snapshot).rows[s.cursor_row].kind,
+            RowKind::FileHeader
         );
         assert!(
             s.view(&f.snapshot)
@@ -2568,9 +3423,9 @@ mod tests {
             PATCH.replace("+new", &format!("+{}", "long_word ".repeat(20))),
             PATCH.replace("sample.txt", "other.txt")
         );
-        let f = Fixture::new(&patch);
+        let mut f = Fixture::new(&patch);
         let mut s = State::default();
-        let l = Layout::new(100, 24);
+        let l = Layout::new(140, 24);
         let mouse = |kind, x, y| MouseEvent {
             kind,
             column: x,
@@ -2608,15 +3463,12 @@ mod tests {
         );
         assert_eq!(s.selection_start, Some(long));
         assert!(s.cursor_row < long);
+        s.sidebar_open = true;
         handle_mouse(
             &f.snapshot,
             &f.store,
             &mut s,
-            mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                l.sidebar_x as u16,
-                3,
-            ),
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 3),
             l,
         );
         assert_eq!(s.active_file, 1);
@@ -2625,15 +3477,18 @@ mod tests {
             &f.snapshot,
             &f.store,
             &mut s,
-            mouse(MouseEventKind::ScrollUp, l.sidebar_x as u16, 4),
+            mouse(MouseEventKind::ScrollUp, 1, 4),
             l,
         );
-        assert_eq!(s.active_file, 0);
+        assert_eq!(s.active_file, 1);
+        assert_eq!(s.file_cursor, 0);
+        f.key(&mut s, KeyCode::Enter, l);
+        let x = l.with_panels(&s).main_x as u16 + 1;
         handle_mouse(
             &f.snapshot,
             &f.store,
             &mut s,
-            mouse(MouseEventKind::ScrollDown, 1, 4),
+            mouse(MouseEventKind::ScrollDown, x, 4),
             l,
         );
         assert!(s.cursor_row >= long);
@@ -2658,17 +3513,19 @@ mod tests {
                 .unwrap()
                 .contains("TAIL")
         );
-        while s.scroll_line
-            < row_height(&f.snapshot, &f.store, &view, &s, s.cursor_row, l) - l.body_height
-        {
-            move_line(&f.snapshot, &f.store, &mut s, 3, true, l);
-        }
+        let cursor = s.cursor_row;
+        let height = row_height(&f.snapshot, &f.store, &view, &s, cursor, l);
+        move_visual(&f.snapshot, &f.store, &mut s, (height - 1) as isize, l);
+        assert_eq!(s.cursor_row, cursor);
         let frame = renderer
             .frame(&f.snapshot, &f.store, &mut s, l, false)
             .unwrap();
         assert!(frame.contains("TAIL"));
         assert!(s.scroll_line > 0);
-        move_line(&f.snapshot, &f.store, &mut s, -3, true, l);
+        let scroll = (s.scroll_row, s.scroll_line);
+        move_visual(&f.snapshot, &f.store, &mut s, -3, l);
+        assert_eq!((s.scroll_row, s.scroll_line), scroll);
+        move_visual(&f.snapshot, &f.store, &mut s, -(l.body_height as isize), l);
         assert!(
             !renderer
                 .frame(&f.snapshot, &f.store, &mut s, l, false)
@@ -2713,6 +3570,34 @@ mod tests {
     }
 
     #[test]
+    fn repeated_navigation_only_paints_changed_rows_and_scrolls_the_body() {
+        let mut f = Fixture::new(&long_patch(120, &[60]));
+        let mut s = State::default();
+        let l = Layout::new(100, 24);
+        let mut renderer = f.renderer(ANSI);
+        renderer
+            .frame(&f.snapshot, &f.store, &mut s, l, true)
+            .unwrap();
+        let mut scrolled_up = false;
+        let mut scrolled_down = false;
+        for key in std::iter::repeat_n('j', 80).chain(std::iter::repeat_n('k', 80)) {
+            f.key(&mut s, KeyCode::Char(key), l);
+            let frame = renderer
+                .frame(&f.snapshot, &f.store, &mut s, l, true)
+                .unwrap();
+            assert!(
+                frame.matches(";1H").count() <= 4,
+                "Navigation repainted unchanged rows"
+            );
+            assert!(frame.contains("\x1b[1;1H"));
+            assert!(frame.contains("\x1b[24;1H"));
+            scrolled_up |= frame.contains("\x1b[1S");
+            scrolled_down |= frame.contains("\x1b[1T");
+        }
+        assert!(scrolled_up && scrolled_down);
+    }
+
+    #[test]
     fn frame_fully_repaints_status_footer_and_static_is_escape_free() {
         let f = Fixture::new(PATCH);
         let mut s = State::default();
@@ -2727,7 +3612,7 @@ mod tests {
         }
         assert!(!frame.contains('\x1b'));
         assert!(frame.contains("files"));
-        assert!(frame.contains("mode=stacked/unfold"));
+        assert!(frame.contains("stacked/unfold"));
         let mut renderer = f.renderer(ANSI);
         s.help = true;
         let frame = renderer
@@ -2735,8 +3620,15 @@ mod tests {
             .unwrap();
         assert!(frame.contains("\x1b[1;1H"));
         assert!(frame.contains("\x1b[12;1H"));
-        assert_eq!(frame.matches("\x1b[K").count(), 12);
+        assert_eq!(frame.matches(";1H").count(), 12);
+        assert!(!frame.contains("\x1b[K"));
         assert!(!frame.contains('\n'));
+        let unchanged = renderer
+            .frame(&f.snapshot, &f.store, &mut s, l, true)
+            .unwrap();
+        assert_eq!(unchanged.matches(";1H").count(), 2);
+        assert!(unchanged.contains("\x1b[1;1H"));
+        assert!(unchanged.contains("\x1b[12;1H"));
     }
 
     #[test]

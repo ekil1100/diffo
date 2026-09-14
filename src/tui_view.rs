@@ -66,6 +66,7 @@ pub struct VisualRow<'a> {
     pub fold_id: Option<FoldId>,
     pub fold_line_count: usize,
     pub fold_expanded: bool,
+    pub fold_lines: &'a [DiffLine],
     pub change_id: Option<usize>,
     pub line: Option<&'a DiffLine>,
     pub left: Option<&'a DiffLine>,
@@ -81,6 +82,7 @@ impl<'a> VisualRow<'a> {
             fold_id: None,
             fold_line_count: 0,
             fold_expanded: false,
+            fold_lines: &[],
             change_id: None,
             line: None,
             left: None,
@@ -118,6 +120,7 @@ pub struct FileView<'a> {
     pub changes: Vec<ChangeSpan>,
     pub additions: usize,
     pub deletions: usize,
+    pub line_number_width: usize,
 }
 
 const CONTEXT_RADIUS: usize = 3;
@@ -135,14 +138,20 @@ pub fn build_file_view<'a>(
         changes: Vec::new(),
         additions: 0,
         deletions: 0,
+        line_number_width: 4,
     };
+    let mut max_line = 0;
     for line in file.hunks.iter().flat_map(|hunk| &hunk.lines) {
+        max_line = max_line
+            .max(line.old_lineno.unwrap_or(0))
+            .max(line.new_lineno.unwrap_or(0));
         match line.kind {
             DiffLineKind::Add => view.additions += 1,
             DiffLineKind::Delete => view.deletions += 1,
             _ => {}
         }
     }
+    view.line_number_width = max_line.to_string().len().max(4);
     if file.is_binary || file.hunks.is_empty() {
         view.rows.push(VisualRow::new(RowKind::FileMeta));
     }
@@ -185,6 +194,7 @@ pub fn build_file_view<'a>(
                         fold_id: Some(id),
                         fold_line_count: i - start,
                         fold_expanded: expanded,
+                        fold_lines: &hunk.lines[start..i],
                         ..VisualRow::new(RowKind::Fold)
                     });
                     if expanded {
@@ -349,6 +359,35 @@ mod tests {
     }
 
     const LONG_CONTEXT: &str = " one\n two\n three\n four\n five\n six\n six-a\n six-b\n six-c\n six-d\n-old();\n+new();\n seven\n eight\n nine\n ten\n eleven\n twelve\n";
+
+    #[test]
+    fn line_number_width_includes_both_sides_and_hidden_context() {
+        let patch = format!(
+            "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -100000,18 +1,18 @@\n{LONG_CONTEXT}"
+        );
+        let file = parse_patch(patch.as_bytes(), DiffSource::Explicit)
+            .unwrap()
+            .remove(0);
+        for mode in [ViewMode::Stacked, ViewMode::Split] {
+            for fold_mode in [FoldMode::Fold, FoldMode::Unfold] {
+                assert_eq!(
+                    build_file_view(&file, 0, mode, fold_mode, &[]).line_number_width,
+                    6
+                );
+            }
+        }
+        assert_eq!(
+            build_file_view(
+                &self::file("+short\n"),
+                0,
+                ViewMode::Stacked,
+                FoldMode::Unfold,
+                &[]
+            )
+            .line_number_width,
+            4
+        );
+    }
 
     #[test]
     fn unfold_shows_long_context_without_fold_row() {

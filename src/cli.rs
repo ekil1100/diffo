@@ -392,7 +392,7 @@ fn output(text: &str) -> Result<()> {
         .map_err(Error::from)
 }
 
-const HELP_TEXT: &str = "diffo - terminal Git diff review\n\nUsage:\n  diffo [git-diff-args]\n  diffo comments list [--file <path>] [--json]\n  diffo comments get <comment-id> [--json]\n  diffo comments add --file <path> --line <n> [--end <n>] --body <text>\n  diffo comments clean [--all] [--file <path>] [--dry-run] [--json]\n  diffo review status [--file <path>] [--json]\n  diffo review mark --file <path> [--reviewed|--unreviewed]\n  diffo themes list\n  diffo themes validate <file>\n\nInteractive keys:\n  j/k line, J/K file, n/p change, C unfold/fold mode, z/Z folds, v stacked/split, r reviewed, c comment, V select, y copy, Esc clear selection, u unreviewed, ? help, q quit\n";
+const HELP_TEXT: &str = "diffo - terminal Git diff review\n\nUsage:\n  diffo [git-diff-args]\n  diffo comments list [--file <path>] [--json]\n  diffo comments get <comment-id> [--json]\n  diffo comments add --file <path> --line <n> [--end <n>] --body <text>\n  diffo comments clean [--all] [--file <path>] [--dry-run] [--json]\n  diffo review status [--file <path>] [--json]\n  diffo review mark --file <path> [--reviewed|--unreviewed]\n  diffo themes list\n  diffo themes validate <file>\n\nInteractive keys:\n  Tab files, Enter open file/view comments, j/k move, PgUp/PgDn page\n  J/K file (restore position), n/p change, G/gg last/first\n  C unfold/fold mode, z/Z folds, v stacked/split, r reviewed, u unreviewed\n  c comment at cursor/selection, V select/clear, y copy\n  Esc clear/close panel, ? help, q quit\n";
 
 #[cfg(test)]
 mod tests {

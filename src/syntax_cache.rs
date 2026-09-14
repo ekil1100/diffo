@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+
+use tree_sitter::Query;
 
 use crate::{
     Error, Result,
@@ -15,6 +17,7 @@ pub struct SyntaxCache {
     target: ReviewTarget,
     debug_git: bool,
     entries: HashMap<(usize, FileSide), Outcome>,
+    queries: HashMap<&'static str, Option<Arc<Query>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +34,7 @@ impl SyntaxCache {
             target: target.clone(),
             debug_git,
             entries: HashMap::new(),
+            queries: HashMap::new(),
         }
     }
 
@@ -63,7 +67,7 @@ impl SyntaxCache {
         file_index: usize,
         file: &DiffFile,
         side: FileSide,
-    ) -> Result<&SideHighlight> {
+    ) -> Result<&mut SideHighlight> {
         let key = (file_index, side);
         // A cache belongs to one immutable snapshot. Cache negative outcomes as
         // well, so repainting a missing/oversized side never repeats Git or I/O.
@@ -71,14 +75,14 @@ impl SyntaxCache {
             let outcome = self.compute_outcome(file, side)?;
             self.entries.insert(key, outcome);
         }
-        match &self.entries[&key] {
+        match self.entries.get_mut(&key).expect("cached syntax outcome") {
             Outcome::Ready(highlight) => Ok(highlight),
             Outcome::Unavailable => Err(Error::SyntaxUnavailable),
             Outcome::TooLarge => Err(Error::SourceTooLarge),
         }
     }
 
-    fn compute_outcome(&self, file: &DiffFile, side: FileSide) -> Result<Outcome> {
+    fn compute_outcome(&mut self, file: &DiffFile, side: FileSide) -> Result<Outcome> {
         let Some(grammar) = file.language.as_deref().and_then(syntax_grammars::find) else {
             return Ok(Outcome::Unavailable);
         };
@@ -89,7 +93,18 @@ impl SyntaxCache {
             Err(Error::SourceTooLarge) => return Ok(Outcome::TooLarge),
             Err(err) => return Err(err),
         };
-        match syntax_query::build(grammar.language(), grammar.query, source) {
+        if source.len() > syntax_query::MAX_FILE_SIZE {
+            return Ok(Outcome::TooLarge);
+        }
+        let language = grammar.language();
+        let Some(query) = self
+            .queries
+            .entry(grammar.name)
+            .or_insert_with(|| syntax_query::compile(&language, grammar.query).ok())
+        else {
+            return Ok(Outcome::Unavailable);
+        };
+        match syntax_query::build(language, Arc::clone(query), source) {
             Ok(highlight) => Ok(Outcome::Ready(highlight)),
             Err(Error::SourceTooLarge) => Ok(Outcome::TooLarge),
             Err(Error::SyntaxUnavailable) => Ok(Outcome::Unavailable),
@@ -210,6 +225,34 @@ mod tests {
             cache.highlight_diff_line(ANSI, catppuccin_mocha(), 0, &file, &absent),
             Err(Error::SyntaxUnavailable)
         ));
+    }
+
+    #[test]
+    fn files_share_compiled_queries_but_not_source_trees() {
+        let (_directory, repo, target, file) = fixture();
+        let mut cache = SyntaxCache::new(&repo, &target, false);
+        for (index, source) in ["fn first() {}\n", "fn second() {}\n"]
+            .into_iter()
+            .enumerate()
+        {
+            fs::write(repo.root_path.join(&file.path), source).unwrap();
+            cache.get(index, &file, FileSide::New).unwrap();
+        }
+        assert_eq!(cache.queries.len(), 1);
+        let query = cache.queries["rust"].as_ref().unwrap();
+        assert_eq!(
+            Arc::strong_count(query),
+            3,
+            "One query shared by two source trees and the cache"
+        );
+        assert_eq!(
+            cache.get(0, &file, FileSide::New).unwrap().line_text(1),
+            Some(b"fn first() {}".as_slice())
+        );
+        assert_eq!(
+            cache.get(1, &file, FileSide::New).unwrap().line_text(1),
+            Some(b"fn second() {}".as_slice())
+        );
     }
 
     #[test]
