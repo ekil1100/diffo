@@ -1,5 +1,7 @@
 # Tree-sitter Syntax Highlighting Implementation Plan
 
+> 历史记录：本文是 Zig 阶段的实施计划。当前 Rust 版本使用官方 Tree-sitter bindings 与现有 vendored grammar；模块和构建说明见 `AGENTS.md`。
+
 ## 1. 文档信息
 
 - 项目名称：diffo

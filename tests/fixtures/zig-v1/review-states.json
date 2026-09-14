@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "states": [
+    {
+        "repository_id": "repo_fd96918bc4822d7b",
+        "review_target_id": "target_f4af5bf8b84150f4",
+        "file_path": "sample.rs",
+        "status": "reviewed",
+        "patch_fingerprint": "sha256:81cc55debad4598f3bd88d3e1a7089486b477de6c2a33c61fb5112b45e5c5995",
+        "updated_at": "2026-09-11T08:40:03Z"
+    }
+  ]
+}

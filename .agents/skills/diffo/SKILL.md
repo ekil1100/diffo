@@ -5,151 +5,102 @@ description: Work with diffo review data from a local Git repository. Use this s
 
 # diffo
 
-Use this skill when the task involves `diffo`, especially when the user wants an agent to read local review comments and act on them.
+通过 JSON CLI 读取本地审阅数据，并将评论转化为有依据的代码工作。不要打开交互 TUI 获取数据。
 
-The main function is to retrieve comments from `diffo` and present them in a useful form for code work.
+## 准备
 
-## Requirements
+在被审阅的仓库中执行命令。优先使用 `PATH` 上的 `diffo`；在 diffo 源码仓库内，也可使用 `./target/debug/diffo` 或 `./target/release/diffo`。
 
-- Run commands from inside the target Git repository.
-- Prefer a `diffo` executable on `PATH`.
-- If `diffo` is not on `PATH`, use `./zig-out/bin/diffo` when present.
-- If neither exists, diffo is built from source (there are no binary releases):
+若没有可用二进制，在 diffo 源码仓库构建：
 
 ```sh
-# Requires Zig 0.16.0 and Git
-zig build
-# binary at zig-out/bin/diffo; optionally install:
-mkdir -p "$HOME/.local/bin" && cp zig-out/bin/diffo "$HOME/.local/bin/diffo"
+# Requires Rust/Cargo 1.88+, Git, and a C11 compiler.
+cargo build --locked
+# Install into ~/.cargo/bin if needed.
+cargo install --path . --locked
 ```
 
-Outside the diffo repository, clone https://github.com/ekil1100/diffo first or ask the user where the binary lives.
+不在源码仓库时，先克隆 https://github.com/ekil1100/diffo 或询问用户二进制位置。不要在被审阅的其他项目中运行上述构建命令。
 
-## Get Comments
-
-First get comments as JSON:
+## 读取评论
 
 ```sh
+git rev-parse --show-toplevel
 diffo comments list --json
-```
-
-If `diffo` is not on `PATH`, use:
-
-```sh
-./zig-out/bin/diffo comments list --json
-```
-
-For one file:
-
-```sh
 diffo comments list --file <path> --json
+diffo comments get <comment-id> --json
 ```
 
-The response envelope is `{schema_version, repository_id, review_target_id, comments}`.
+列表 envelope 为 `{schema_version, repository_id, review_target_id, comments}`。
 
-Scope: the list covers **all comments saved for the repository**, including ones created under explicit review targets such as `diffo HEAD^`. The top-level `review_target_id` is the current review target; each comment carries its own `review_target_id`, which may differ. Compare them when the task is scoped to the current target.
+**范围：列表包含本仓库所有 target 的评论**，包括在 `diffo HEAD^` 等显式 target 下创建的评论。顶层 `review_target_id` 是当前 target，每条评论的 `review_target_id` 可能不同；用户限定 target 时需比对。
 
-## Interpret Comment JSON
+每条评论的关键字段：
 
-Each comment has the fields an agent needs for code work:
+- `comment_id`：稳定评论标识。
+- `file_path`、`start_line`、`end_line`、`side`：文件、行范围与 old/new 侧。
+- `body`、`author`：评论正文及作者。
+- `match_status`：当前锚点状态。
+- `anchor.patch_fingerprint`、`anchor.hunk_header`、`anchor.stable_line_ids`：原始 patch 与行锚点。
+- `review_target_id`：创建评论时的 target。
 
-- `comment_id`: stable identifier for referencing the comment.
-- `file_path`: file that the comment applies to.
-- `start_line`: primary line number.
-- `end_line`: end of the range; equals `start_line` for single-line comments.
-- `side`: usually `new` or `old`.
-- `body`: reviewer text.
-- `author`: comment author.
-- `match_status`: current anchor status.
-- `anchor.patch_fingerprint`: patch fingerprint from the original comment anchor.
-- `anchor.hunk_header`: original hunk header.
-- `anchor.stable_line_ids`: content-derived line identifiers.
-- `review_target_id`: review target the comment belongs to.
+处理状态：
 
-Treat `match_status` carefully:
+- `exact`：存储的 patch 指纹仍匹配，可以核对代码后处理。
+- `stale`：patch 已改变，修改前指出不确定性并验证实际位置。
+- `missing`：文件不再出现在当前 diff 中，不要猜测位置。
+- `relocated`：为未来功能预留；目前需人工核实。
 
-- `exact`: the comment still applies to the current patch.
-- `stale`: the file still exists in the current diff, but the patch changed. Mention this uncertainty before editing.
-- `missing`: the file is no longer in the current diff. Do not invent a location; report it.
-- `relocated`: reserved for future use; verify manually before editing.
+## 工作流程
 
-## Agent Workflow
+1. 确认仓库位置并读取 JSON。
+2. 评论为空时说明当前仓库没有保存的 diffo 评论，不输出空评论清单。
+3. 按文件分组，读取每条评论附近的实际源码。
+4. 若只要求总结，报告文件、行范围、评论标识和状态。
+5. 若要求修复，限定修改范围为已验证的评论要求，执行项目验证命令。
+6. 报告修复结果、验证和未解决的评论；不要自动清理评论或标记已审阅。
 
-1. Confirm the current directory is the repository under review (`git rev-parse --show-toplevel`).
-2. Retrieve comments with JSON output.
-3. If comments are empty, say there are no diffo comments saved for this repository.
-4. Group comments by `file_path`.
-5. For each comment, read the relevant file and inspect the nearby lines.
-6. If the user asked for a summary, report comments grouped by file with line ranges and status.
-7. If the user asked to fix issues, make scoped edits that address the comments, then run the project validation command when available.
-
-## Output Format
-
-When summarizing comments, use this format:
+建议摘要格式：
 
 ```text
-Diffo comments:
-
-- path/to/file.ext:12
+- src/foo.rs:42 [stale]
   - id: cmt_...
-  - status: exact
   - comment: ...
   - action: ...
 ```
 
-For stale or missing comments, include the status inline:
+## 其他命令
 
-```text
-- src/foo.zig:42 [stale]
-  - comment: ...
-  - note: Patch changed since this comment was created; verify before editing.
-```
-
-When there are no comments, state exactly: "There are no diffo comments saved for this repository." — skip the block format.
-
-## Useful Related Commands
-
-Review status:
+审阅状态：
 
 ```sh
 diffo review status --json
 diffo review status --file <path> --json
 ```
 
-`files[].status` is `reviewed` or `unreviewed`; files default to `unreviewed` when no state has been saved yet.
+`files[].status` 为 `reviewed` 或 `unreviewed`。未保存状态或 patch 已改变时为 `unreviewed`。
 
-Get one comment:
-
-```sh
-diffo comments get <comment-id> --json
-```
-
-Add a comment without the TUI (the file **and** line must be part of the current review target's diff, or the command fails with `invalid arguments`):
+添加评论：文件和行必须存在于当前工作区 target 的 diff 中，否则返回 `invalid arguments`。
 
 ```sh
 diffo comments add --file <path> --line <n> [--end <n>] --body <text>
 ```
 
-Clean up comments whose anchors expired (`stale` or `missing`), or wipe all saved comments with `--all`:
+清理与标记：
 
 ```sh
-diffo comments clean --dry-run --json   # preview removals
-diffo comments clean                    # remove stale/missing in current target
-diffo comments clean --all              # remove every saved comment
-```
-
-Mark a file reviewed after addressing comments:
-
-```sh
+diffo comments clean --dry-run --json
+diffo comments clean
+diffo comments clean --all
 diffo review mark --file <path> --reviewed
 ```
 
-Do not mark files reviewed or run `comments clean` without `--dry-run` unless the user asked for that or the task explicitly includes completing the review workflow.
+默认清理仅删除当前 target 的 `stale` / `missing` 评论；`--all` 删除仓库所有 target 的评论。**除非用户明确要求，或任务明确包含完成审阅流程，不要执行非 dry-run 清理，也不要标记已审阅。**
 
-## Failure Handling
+## 错误处理
 
-- If `diffo comments list --json` fails, rerun with `--debug-git` only when the user needs debugging details.
-- `invalid arguments` from `comments add` usually means the file or line is not in the current diff, not a syntax error in your flags.
-- If the command is unavailable, explain which executable was missing and point to the build-from-source steps above.
-- If JSON parsing fails, show the raw command output briefly and stop before editing code.
-- Do not open the interactive TUI to retrieve comments; use CLI JSON for agent workflows.
+- Git 失败时，仅在需要诊断细节时附加 `--debug-git` 重试。
+- `comments add` 的 `invalid arguments` 可能是文件或行不在 diff 中，先核对位置。
+- 找不到二进制时指出尝试的路径，并使用上面的 Cargo 构建步骤。
+- JSON 损坏时展示简短错误并停止修改，不重置用户数据。
+- Rust 版本沿用 Zig 版本的数据目录、schema-v1 和身份算法，不需要转换已有评论。
