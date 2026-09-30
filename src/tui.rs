@@ -49,8 +49,8 @@ const HELP: &[&str] = &[
     "Tab          Open / close file navigation",
     "j/k arrows   Move cursor; select a file in FILES",
     "Enter        Open selected file / view comments",
-    "J/K          Next / previous file, keeping its position",
-    "n/p          Next / previous change",
+    "N/P, J/K     Next / previous file, keeping its position",
+    "n/p          Next / previous change, crossing file boundaries",
     "PgUp/PgDn    Page; scroll comments in COMMENTS",
     "G/gg         Last / first line",
     "c            Comment on cursor / selected code",
@@ -673,10 +673,10 @@ fn handle_key(
             KeyCode::Enter => state.focus = Focus::Code,
             KeyCode::Home | KeyCode::Char('g') => state.comment_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => state.comment_scroll = usize::MAX,
-            KeyCode::Char('c' | '?' | 'J' | 'K') => {}
+            KeyCode::Char('c' | '?' | 'J' | 'K' | 'N' | 'P') => {}
             _ => return Ok(KeyAction::Continue),
         }
-        if !matches!(key.code, KeyCode::Char('c' | '?' | 'J' | 'K')) {
+        if !matches!(key.code, KeyCode::Char('c' | '?' | 'J' | 'K' | 'N' | 'P')) {
             return Ok(KeyAction::Continue);
         }
     }
@@ -715,8 +715,8 @@ fn handle_key(
                 layout,
             );
         }
-        KeyCode::Char('J') => move_file(snapshot, store, state, 1, layout),
-        KeyCode::Char('K') => move_file(snapshot, store, state, -1, layout),
+        KeyCode::Char('J' | 'N') => move_file(snapshot, store, state, 1, layout),
+        KeyCode::Char('K' | 'P') => move_file(snapshot, store, state, -1, layout),
         KeyCode::Char('n') | KeyCode::Char('p') => {
             let view = state.view(snapshot);
             let next = if key.code == KeyCode::Char('n') {
@@ -728,6 +728,35 @@ fn handle_key(
                 state.cursor_row = row;
                 state.cursor_line = 0;
                 center(snapshot, store, &view, state, layout);
+            } else {
+                let forward = key.code == KeyCode::Char('n');
+                let index = move_index(
+                    state.active_file,
+                    snapshot.files.len(),
+                    if forward { 1 } else { -1 },
+                );
+                if index != state.active_file {
+                    open_file(snapshot, store, state, index, layout);
+                    let layout = layout.with_panels(state);
+                    let view = state.view(snapshot);
+                    let change = if forward {
+                        view.changes.first()
+                    } else {
+                        view.changes.last()
+                    };
+                    state.cursor_row = change.map_or_else(
+                        || {
+                            if forward {
+                                0
+                            } else {
+                                view.rows.len().saturating_sub(1)
+                            }
+                        },
+                        |change| change.start_row,
+                    );
+                    state.cursor_line = 0;
+                    center(snapshot, store, &view, state, layout);
+                }
             }
         }
         KeyCode::Char('C') | KeyCode::Char('z') | KeyCode::Char('Z') => {
@@ -3322,6 +3351,66 @@ mod tests {
         s.cursor_row = view.rows.len() - 2;
         center(&f.snapshot, &f.store, &view, &mut s, l);
         assert_eq!(s.scroll_row, s.cursor_row - 5);
+    }
+
+    #[test]
+    fn change_navigation_crosses_files_in_both_directions() {
+        let patch = long_patch(40, &[8, 20, 32]);
+        let patch = format!("{}{}", patch, patch.replace("sample.txt", "other.txt"));
+        let mut f = Fixture::new(&patch);
+        assert_eq!(f.snapshot.files.len(), 2);
+        let mut s = State::default();
+        let l = Layout::new(80, 12);
+        first_change(&f.snapshot, &f.store, &mut s, l);
+        f.key(&mut s, KeyCode::Char('p'), l);
+        assert_eq!(s.active_file, 0);
+        for _ in 0..3 {
+            f.key(&mut s, KeyCode::Char('n'), l);
+        }
+        assert_eq!(s.active_file, 1);
+        assert_eq!(s.cursor_row, s.view(&f.snapshot).changes[0].start_row);
+        s.selection_start = Some(s.cursor_row);
+        f.key(&mut s, KeyCode::Char('p'), l);
+        assert_eq!(s.active_file, 0);
+        assert_eq!(s.selection_start, None);
+        assert_eq!(s.cursor_row, s.view(&f.snapshot).changes[2].start_row);
+        f.key(&mut s, KeyCode::Char('n'), l);
+        assert_eq!(s.active_file, 1);
+        assert_eq!(s.cursor_row, s.view(&f.snapshot).changes[0].start_row);
+        for _ in 0..3 {
+            f.key(&mut s, KeyCode::Char('n'), l);
+        }
+        assert_eq!(s.active_file, 1);
+        assert_eq!(s.cursor_row, s.view(&f.snapshot).changes[2].start_row);
+    }
+
+    #[test]
+    fn shift_n_p_navigate_files_from_code_and_comments() {
+        let patch = format!("{}{}", PATCH, PATCH.replace("sample.txt", "other.txt"));
+        let mut f = Fixture::new(&patch);
+        let l = Layout::new(100, 12);
+        for focus in [Focus::Code, Focus::Comments] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let mut s = State {
+                    focus,
+                    selection_start: Some(0),
+                    ..State::default()
+                };
+                for (key, expected_file) in [('N', 1), ('N', 1), ('P', 0), ('P', 0)] {
+                    s.focus = focus;
+                    handle_key(
+                        &f.snapshot,
+                        &mut f.store,
+                        &mut s,
+                        KeyEvent::new(KeyCode::Char(key), modifiers),
+                        l,
+                    )
+                    .unwrap();
+                    assert_eq!(s.active_file, expected_file);
+                    assert_eq!(s.selection_start, None);
+                }
+            }
+        }
     }
 
     #[test]
